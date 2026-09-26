@@ -6,12 +6,12 @@ import { goalErrorMessage } from '../shared/goal-errors.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
 import { prepareSessionPrompt } from './session/prompt.js';
 import { pendingChatModelRequest, observeChatModels, requestChatModels } from './chat-models.js';
-import { isDeliberateEffort, isProModel } from '../shared/chat-models.js';
+import { isProModel } from '../shared/chat-models.js';
 import { supportsFinishAutomation } from '../shared/finish.js';
-import { injectedUserMessage, recordedRequestTurn, responseTurnId, type TimelineTurns } from '../shared/chronology.js';
+import { injectedUserMessage, recordedRequestTurn, responseTurnId } from '../shared/chronology.js';
 import type { SessionSummary } from '../shared/session.js';
 import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, type InputActivity } from './session/input.js';
-import { pluginRefreshPublications, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
+import { pluginRefreshPublications, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh, forcedPluginRefreshPending, rediscoverPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 let browserWake: ReturnType<typeof attachBrowserWake> | null = null;
@@ -20,7 +20,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, fileProviderHoldInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -98,14 +98,12 @@ import {
   recordAgentMessage,
   recordChatObservations,
   recordRequestEvidence,
-  recordNote,
   recordProgress,
   restoreRecordedConversation,
   setCallAttributionListener,
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
-import { noticeChatStopped } from './stuck-notice.js';
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
@@ -207,7 +205,6 @@ import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
-import { shippedExtensionBuild } from './extension-path.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = BROWSER_BRIDGE_PORTS;
@@ -528,41 +525,6 @@ const commandRedeems = new Map<string, Promise<void>>();
 let requestWindow = { start: Date.now(), count: 0 };
 const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
-/**
- * When each (version, build) pair was last announced. Two browsers with the extension installed
- * alternate requests, and a single "current" pair would turn every alternation into a fresh
- * "connected" line, a repeated mismatch warning and a renderer push: measured 2026-09-26, a
- * normal and a debugging Chrome on different builds wrote ~80 of each per minute for an hour.
- */
-const announcedExtensions = new Map<string, number>();
-const EXTENSION_ANNOUNCE_MS = 30 * 60_000;
-/** When each extension build last made a request, to tell a stale companion from a lone one. */
-const extensionBuildSeenAt = new Map<string, number>();
-const STALE_COMPANION_WINDOW_MS = 60_000;
-
-function extensionBuildOf(req: http.IncomingMessage): string | null {
-  const build = req.headers['x-extension-build'];
-  return typeof build === 'string' && /^[0-9a-f]{12}$/.test(build) ? build : null;
-}
-
-/**
- * Whether this request comes from an out-of-date companion while an up-to-date one is present.
- *
- * With the extension installed in two browsers, both poll and both may claim work. Measured
- * 2026-09-26: a planner input was claimed twice within 11 ms and sent by a second Chrome still
- * running the pre-update extension, which could not collect the answer on the newer ChatGPT
- * shell — so the planner timed out while the current browser's helper tab sat empty. A stale
- * companion is refused work only while a companion on the shipped build was seen within the last
- * minute; a lone browser on an older build, or any build of an unpackaged checkout, keeps working
- * exactly as before.
- */
-function staleCompanion(req: http.IncomingMessage): boolean {
-  const stamp = extensionBuildOf(req);
-  const shipped = shippedExtensionBuild();
-  if (!stamp || !shipped || stamp === shipped) return false;
-  const current = extensionBuildSeenAt.get(shipped);
-  return current !== undefined && Date.now() - current < STALE_COMPANION_WINDOW_MS;
-}
 let versionWarned = false;
 let latestCompanionDiagnostics: CompanionDiagnostics | null = null;
 let companionDiagnosticsRevision = 0;
@@ -883,41 +845,13 @@ function protocolCompatible(req: http.IncomingMessage): boolean {
 function noteExtensionVersion(req: http.IncomingMessage): void {
   const version = req.headers['x-extension-version'];
   const protocol = extensionProtocol(req);
-  const stamp = extensionBuildOf(req);
-  if (stamp) {
-    extensionBuildSeenAt.delete(stamp);
-    extensionBuildSeenAt.set(stamp, Date.now());
-    if (extensionBuildSeenAt.size > 16) extensionBuildSeenAt.delete(extensionBuildSeenAt.keys().next().value!);
-  }
-  if (typeof version !== 'string') return warnProtocol(protocol);
-  extensionVersion = version.slice(0, 32);
-  const key = `${extensionVersion}\u0000${stamp ?? ''}`;
-  const announcedAt = announcedExtensions.get(key);
-  if (announcedAt === undefined || Date.now() - announcedAt >= EXTENSION_ANNOUNCE_MS) {
-    announcedExtensions.delete(key);
-    announcedExtensions.set(key, Date.now());
-    if (announcedExtensions.size > 16) announcedExtensions.delete(announcedExtensions.keys().next().value!);
-    logInfo(`bridge: browser extension ${extensionVersion} connected${stamp ? ` (build ${stamp})` : ''}`);
-    // Chrome answers "which manifest did I load" with the version and keeps running whatever
-    // service worker it already had, so an extension folder replaced under a live browser
-    // reports the new version and runs the old code — and every symptom after that points
-    // somewhere else. Said once per announcement, and only when both ends reported a stamp.
-    const shipped = shippedExtensionBuild();
-    if (shipped && stamp && stamp !== shipped) {
-      logWarn(
-        `bridge: the browser is running extension build ${stamp}, but this app ships ${shipped}. ` +
-          'Chrome keeps a service worker alive across a folder change, so reload the extension at ' +
-          'chrome://extensions to pick up the shipped code.'
-      );
-    }
+  if (typeof version === 'string' && version !== extensionVersion) {
+    extensionVersion = version.slice(0, 32);
+    logInfo(`bridge: browser extension ${extensionVersion} connected`);
     // Even an incompatible peer reports its version before the protocol fence.
     // Publish that evidence without falsely granting compatible browser presence.
     changed();
   }
-  warnProtocol(protocol);
-}
-
-function warnProtocol(protocol: number | null): void {
   if (!versionWarned && protocol !== null && protocol !== BRIDGE_PROTOCOL) {
     versionWarned = true;
     logWarn(
@@ -1730,8 +1664,8 @@ function goalActiveFor(id: string): boolean {
 }
 
 /** Policy gate only: the live silence grant files the outbox's exact recovery claim. */
-export function recoveryInputAllowed(sessionId: string, id: string): boolean {
-  return (goalActiveFor(id) || getConfig().ui.autoContinue !== false) && !goalFencedChat(id) &&
+export function recoveryInputAllowed(sessionId: string, id: string, kind?: 'provider-hold'): boolean {
+  return (kind === 'provider-hold' || goalActiveFor(id) || getConfig().ui.autoContinue !== false) && !goalFencedChat(id) &&
     !isChatBlocked(id) && !stopRequestedFor(id) && !continuationForSession(sessionId);
 }
 
@@ -1934,14 +1868,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (route === '/plugin-refresh' && req.method === 'POST') {
     const raw = await readBody(req);
     const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-    if (body.action === 'pending') return json(res, 200, { requests: getConfig().ui.autoRefreshPlugins === true ? await pendingPluginRefreshes() : [] }, origin);
+    const refreshEnabled = getConfig().ui.autoRefreshPlugins === true || await forcedPluginRefreshPending();
+    if (body.action === 'pending') return json(res, 200, { requests: refreshEnabled ? await pendingPluginRefreshes() : [] }, origin);
     // Turning the setting off also revokes a request already handed to the page.
-    if (body.action === 'claim' && getConfig().ui.autoRefreshPlugins !== true) return json(res, 409, { ok: false, error: 'automatic_refresh_disabled' }, origin);
+    if (body.action === 'claim' && !refreshEnabled) return json(res, 409, { ok: false, error: 'automatic_refresh_disabled' }, origin);
     if (typeof body.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.id)) return json(res, 400, { error: 'invalid_request' }, origin);
     let ok = false;
     if (body.action === 'fail' && typeof body.error === 'string') ok = await failPluginRefresh({ id: body.id, error: body.error.slice(0, 200) });
     else if (typeof body.appId === 'string' && /^asdk_app_[a-zA-Z0-9_-]{1,160}$/.test(body.appId)) {
-      if ((body.action === 'claim' || body.action === 'current') && typeof body.connectorName === 'string') ok = await claimPluginRefresh({ id: body.id, appId: body.appId, connectorName: body.connectorName, tools: body.tools, alreadyCurrent: body.action === 'current' });
+      if (body.action === 'rediscover') ok = await rediscoverPluginRefresh({ id: body.id, appId: body.appId });
+      if ((body.action === 'claim' || body.action === 'current') && typeof body.connectorName === 'string') ok = await claimPluginRefresh({ id: body.id, appId: body.appId, connectorName: body.connectorName, tools: body.tools, alreadyCurrent: body.action === 'current', force: body.force === true });
       if (body.action === 'manual' && typeof body.connectorName === 'string' && typeof body.error === 'string') ok = await requireManualPluginRefresh({ id: body.id, appId: body.appId, connectorName: body.connectorName, tools: body.tools, error: body.error.slice(0, 200) });
       if (body.action === 'complete') ok = await completePluginRefresh({ id: body.id, appId: body.appId, tools: body.tools, versionId: typeof body.versionId === 'string' ? body.versionId.slice(0, 200) : undefined });
     }
@@ -2007,7 +1943,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         conversations: live,
         stopTurns: await pendingStopCommands(),
         modelCatalogRequest: pendingChatModelRequest(),
-        pluginRefreshRequests: getConfig().ui.autoRefreshPlugins === true ? pluginRefreshPublications().map(({ surface, schemaId, connectorName }) => ({ surface, schemaId, connectorName })) : [],
+        pluginRefreshRequests: getConfig().ui.autoRefreshPlugins === true || await forcedPluginRefreshPending() ? pluginRefreshPublications().map(({ surface, schemaId, connectorName }) => ({ surface, schemaId, connectorName })) : [],
         browserPreferenceRequest: pendingBrowserPreferenceRequest(),
         inputOpeningIds: inputRows.filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).map(row => row.id),
         inputs: [...(await pendingBrowserInputs()).filter(input => !input.conversationId || runningToolCalls(input.conversationId) === 0),
@@ -2039,6 +1975,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       observeUsage(body?.rows, body?.observedAt);
       return json(res, 200, { ok: true }, origin);
     } catch { return json(res, 400, { error: 'invalid_usage' }, origin); }
+  }
+
+  if (route === '/provider-hold' && req.method === 'POST') {
+    const body = await readBody(req) as Record<string, unknown>;
+    const target = conversationId(body?.conversationId);
+    const heldTurn = typeof body?.turnId === 'string' && body.turnId.length <= 256 ? body.turnId : '';
+    if (!target || !heldTurn) return json(res, 400, { error: 'invalid_provider_hold' }, origin);
+    const session = await findSessionByConversation(target, { requireUnique: true });
+    const current = !!session && session.conversationId === target && session.activeTurnId === heldTurn;
+    // A user/owner veto is terminal for this mounted hold. Report it handled so the page does
+    // not spin on a component the app deliberately will not recover. Transient source state
+    // (for example an in-flight local tool) still returns false and is retried by the page.
+    const allowed = current && recoveryInputAllowed(session!.id, target, 'provider-hold');
+    const ok = current && (!allowed || await fileProviderHoldInput(session!.id, target, heldTurn));
+    if (ok) changed();
+    return json(res, 200, { ok }, origin);
   }
 
   if (['/input/claim', '/input/bind', '/input/ack', '/input/fail', '/input/answer', '/input/progress', '/input/attachment'].includes(route) && req.method === 'POST') {
@@ -2097,7 +2049,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const target = body.conversationId === null ? null : conversationId(body.conversationId);
     if (body.conversationId !== null && !target) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     if (body.recoveryAction === 'stop' || body.recoveryAction === 'stopped' || body.recoveryAction === 'reloaded') {
-      const ok = !!target && recoveryInputAllowed((await findSessionByConversation(target))?.id ?? '', target) &&
+      const row = (await listInputs()).find(entry => entry.id === body.id && entry.owner === body.owner);
+      const ok = !!target && recoveryInputAllowed((await findSessionByConversation(target))?.id ?? '', target,
+        row?.recovery?.providerHold ? 'provider-hold' : undefined) &&
         await advanceRecoveryInput(body.id, body.owner, target, body.recoveryAction);
       if (ok) changed();
       return json(res, 200, { ok }, origin);
@@ -2109,13 +2063,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     if (body.authorize === true) return json(res, 200, { ok: await authorizeBrowserInput(body.id, body.owner, target) }, origin);
     if (target && runningToolCalls(target) > 0) return json(res, 200, { input: null }, origin);
-    if (staleCompanion(req)) return json(res, 200, { input: null }, origin);
     const input = await claimBrowserInput(body.id, body.owner, target, body.requiresAuthorization === true);
     return json(res, 200, { input }, origin);
   }
 
   if (route === '/repairs/claim' && req.method === 'POST') {
-    if (staleCompanion(req)) return json(res, 200, { allowed: false }, origin);
     let body: unknown;
     try { body = await readBody(req); } catch { return json(res, 400, { error: 'bad_request' }, origin); }
     const token = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).token : null;
@@ -2135,7 +2087,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (allowed) {
       repair.claimed = true;
       if (repair.reason === 'assistant-error' && repair.assistantSource)
-        turnRepairSpent.set(conversationId, { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token, at: Date.now() });
+        turnRepairSpent.set(conversationId, { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token });
       if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
         repair.attribution.incident.firstAttemptAt = Date.now();
     }
@@ -2432,9 +2384,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const since = Number(url.searchParams.get('since') ?? 0);
     const goalClient = (url.searchParams.get('goalClient') ?? '').slice(0, 100);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
-    // A page asking about this chat is the one thing that disproves the no-page verdict, and it
-    // is the only thing that lifts it.
-    pagelessChats.delete(id);
     noteFiberHealth(id, url.searchParams.get('fiber'));
     const retiredWorker = retiredWorkerForConversation(id);
     const superseded = await conversationWasSuperseded(id);
@@ -2561,15 +2510,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const activityExpiry = summary ? sessionActivityExpiresAt(summary) : undefined;
     const hasActivityDeadline = activityExpiry !== undefined;
     const activityCurrent = runningToolCalls(id) > 0 || (activityExpiry !== null && activityExpiry !== undefined && activityExpiry > Date.now());
-    // A worker this app put to sleep for silence has no turn to hand back. Its open turn is one
-    // the app already judged dead; a reloaded page adopting it counts as generating and refuses
-    // the wake until the ten-minute stall closes it — past the wake's own three-minute deadline.
-    // Measured 2026-09-26: worker-8's turn from 17:04 the day before, adopted on reopen, failed
-    // one wake outright. A turn that really still runs shows Stop and is claimed afresh.
-    const sleptWorker = agentInfoForOwnedConversation(id);
-    const sleptOverTurn = sleptWorker?.role === 'worker' &&
-      (sleptWorker.state === 'sleeping' || sleptWorker.state === 'waking') &&
-      sleptWorker.sleptAt !== null && live.activeTurnStartedAt !== null && live.activeTurnStartedAt <= sleptWorker.sleptAt;
     const pendingStop = !superseded && summary?.conversationId === id && summary.activeTurnId === live.activeTurnId && stopRequestedFor(id, live.activeTurnId)
       ? commands.find(command => command.spec.type === 'stop' && command.spec.sessionId === live!.sessionId && command.spec.turnId === live!.activeTurnId) : undefined;
     if (!automaticCompactionAllowed(summary)) await cancelAutomaticResumesNow(live.sessionId);
@@ -2822,14 +2762,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // The generation this chat currently has open, if it has one. A content script that
         // has just been reloaded into a turn already in flight adopts this instead of
         // minting a second id for the same run. See liveConversations().
-        activeTurnId: sleptOverTurn || (hasActivityDeadline && !activityCurrent && !pendingStop) ? null : live.activeTurnId ?? null,
+        activeTurnId: hasActivityDeadline && !activityCurrent && !pendingStop ? null : live.activeTurnId ?? null,
         // Durable answer identity survives a quiet deadline and app/extension restart.
         // Boot adoption must not mint a replacement turn merely because liveness expired.
-        recordedTurnId: sleptOverTurn ? null : live.activeTurnId ?? null,
-        recordedQuestionId: live.activeTurnId && !sleptOverTurn ? summary?.timelineTurns?.[live.activeTurnId]?.questionId ?? null : null,
-        // The question whose turn this app has already ended, while nothing is running. See
-        // settledQuestionOf(): a reloaded page must not reopen it as a turn nobody recorded.
-        settledQuestionId: live.activeTurnId ? null : settledQuestionOf(summary?.timelineTurns),
+        recordedTurnId: live.activeTurnId ?? null,
+        recordedQuestionId: live.activeTurnId ? summary?.timelineTurns?.[live.activeTurnId]?.questionId ?? null : null,
         ...(pendingStop?.spec.type === 'stop' ? { stopTurn: { turnId: pendingStop.spec.turnId, userMessageId: pendingStop.spec.userMessageId ?? null } } : {}),
         // A revival names an existing worker conversation. The extension, which alone can
         // inspect Chrome's real tab set, routes it to that tab before it considers opening one.
@@ -3816,7 +3753,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // token as everything else — it is a correlation marker, which is why a leaked URL or a
   // synced history entry is worth nothing on its own.
   if (route === '/commands/redeem' && req.method === 'POST') {
-    if (staleCompanion(req)) return json(res, 409, { error: 'stale_extension_build' }, origin);
     let body: Record<string, unknown>;
     try {
       body = (await readBody(req)) as Record<string, unknown>;
@@ -5770,14 +5706,6 @@ interface ActivityGrant {
   thinkingFailed?: true;
   /** Exact source-turn MCP proof; only a full final response consumes its silence window. */
   mcpBacked?: true;
-  /**
-   * The observed reasoning effort makes long silences normal — see `isDeliberateEffort`.
-   *
-   * Kept apart from `model` on purpose. Pro carries rules beyond the silence window, Continue
-   * eligibility among them, and an ordinary model thinking hard must not inherit those merely
-   * because it is quiet. Every `model === 'pro'` decision therefore stays exactly as it was.
-   */
-  deliberate?: true;
 }
 
 const activeUntil = new Map<string, ActivityGrant>();
@@ -5787,20 +5715,15 @@ const awaitingReturn = new Set<string>();
 
 /** A semantic turn start arms the silence deadline; later evidence of work pushes it forward. */
 function grantActivity(conversationId: string, sessionId: string, at = Date.now(), window = CHAT_SILENCE_MS,
-  turn?: Pick<ActivityGrant, 'turnId' | 'model' | 'mcpBacked' | 'deliberate'>): void {
+  turn?: Pick<ActivityGrant, 'turnId' | 'model' | 'mcpBacked'>): void {
   if (!sessionId) return;
   const previous = activeUntil.get(conversationId);
   const ownership = turn ?? (previous?.sessionId === sessionId ? previous : { turnId: null, model: 'unknown' as const });
   if (isChatBlocked(conversationId) || (ownership.model === 'pro' && stopRequestedFor(conversationId) && !ownership.mcpBacked)) return;
   const evidenceAt = previous?.sessionId === sessionId && previous.turnId === ownership.turnId ? Math.max(previous.evidenceAt, at) : at;
   const mcpBacked = ownership.mcpBacked || (previous?.sessionId === sessionId && previous.turnId === ownership.turnId && previous.mcpBacked);
-  // Carried the same way as `mcpBacked`: a renewal on the same turn must not lose the fact that
-  // this is a thinking turn, or the window would snap back to two minutes mid-thought.
-  const deliberate = ownership.deliberate || (previous?.sessionId === sessionId && previous.turnId === ownership.turnId && previous.deliberate);
-  activeUntil.set(conversationId, { sessionId, evidenceAt,
-    until: evidenceAt + (ownership.model === 'pro' || deliberate ? PRO_SILENCE_MS : window),
-    turnId: ownership.turnId, model: ownership.model,
-    ...(mcpBacked ? { mcpBacked: true } : {}), ...(deliberate ? { deliberate: true as const } : {}) });
+  activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model,
+    ...(mcpBacked ? { mcpBacked: true } : {}) });
   awaitingReturn.delete(conversationId);
   armSilenceSweep();
   void considerAutomaticCompaction(conversationId, sessionId);
@@ -5838,11 +5761,8 @@ export const PRO_SILENCE_MS = 10 * 60_000;
 export const PRO_ACTIVITY_MS = 10 * 60_000;
 
 /** Failure shortens Pro silence; it never counts as new model work. */
-function silenceWindowMs(grant: Pick<ActivityGrant, 'model' | 'thinkingFailed' | 'deliberate'>): number {
-  if (grant.model === 'pro') return grant.thinkingFailed ? 5 * 60_000 : PRO_SILENCE_MS;
-  // A turn thinking at high effort or above is quiet for minutes between tool calls, and two
-  // minutes of that used to buy it a reload that killed the stream. See `deliberate`.
-  return grant.deliberate ? PRO_SILENCE_MS : CHAT_SILENCE_MS;
+function silenceWindowMs(grant: Pick<ActivityGrant, 'model' | 'thinkingFailed'>): number {
+  return grant.model === 'pro' ? grant.thinkingFailed ? 5 * 60_000 : PRO_SILENCE_MS : CHAT_SILENCE_MS;
 }
 
 /** Display can outlive the silence deadline without granting a browser action. */
@@ -6035,12 +5955,12 @@ async function considerAutomaticCompaction(conversationId: string, sessionId: st
   compactionFilings.add(conversationId);
   try {
     const summary = await getSession(sessionId).catch(() => null);
-    if (!summary || summary.conversationId !== conversationId || summary.endedAt !== null || summary.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(summary, hasCurrentWork())) return;
+    if (!summary || summary.conversationId !== conversationId || summary.endedAt !== null || summary.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(summary)) return;
     if (await conversationWasSuperseded(conversationId)) return;
     if (failedTurn && !await failedCompactionTurnCurrent(conversationId, sessionId, failedTurn)) return;
     // Re-read after the awaits: the turn may have ended, or a page may have filed by hand.
     const current = await getSession(sessionId);
-    if (!current || current.conversationId !== conversationId || current.endedAt !== null || current.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(current, hasCurrentWork())) return;
+    if (!current || current.conversationId !== conversationId || current.endedAt !== null || current.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(current)) return;
     if (failedTurn && !await failedCompactionTurnCurrent(conversationId, sessionId, failedTurn)) return;
     if ((!failedTurn && !hasCurrentWork()) || continuationForSession(sessionId) || goalFencedChat(conversationId) ||
         stopRequestedFor(conversationId) || !getConfig().compaction.auto || !automaticCompactionAllowed(current)) return;
@@ -6161,7 +6081,6 @@ async function restoreReturnedPageActivity(conversationId: string, sessionId: st
   const grant: ActivityGrant = { sessionId, turnId: session.activeTurnId,
     evidenceAt: session.lastToolCallAt, until: session.lastToolCallAt,
     model: selected?.conversationId === conversationId ? isProModel(selected.model, selected.reasoningEffort) ? 'pro' : 'other' : 'unknown',
-    ...(selected?.conversationId === conversationId && isDeliberateEffort(selected.reasoningEffort) ? { deliberate: true as const } : {}),
     mcpBacked: true };
   if (!await silenceSourceCurrent(conversationId, grant) || activeUntil.has(conversationId)) return;
   grantActivity(conversationId, sessionId, Math.min(Date.now(), grant.evidenceAt), CHAT_SILENCE_MS, grant);
@@ -6384,14 +6303,6 @@ interface Repair {
   assistantSource?: { key: string; turnId: string | null; completed: boolean };
   attribution?: { incident: UnattributedIncident; candidate: UnattributedCandidate };
   claimed?: boolean;
-  /**
-   * How many times this exact repair has been offered to a browser that never claimed it.
-   *
-   * Only the unclaimed path counts. A claimed repair is bounded by the reported-failure ceilings
-   * already in this file; this counts the case none of them can see, because every one of them
-   * needs a page to report something back.
-   */
-  offers?: number;
   /** Stable local owner; the browser action is valid only while this session is still here. */
   sessionId: string;
   endedTurns: number;
@@ -6534,51 +6445,7 @@ const lastBrowserRecoveryAt = new Map<string, number>();
  * Reserved at the browser's action claim, before Chrome can reload. A lost ACK cannot
  * refund it when another recovery takes over. Only a positive no-action failure can release it.
  */
-const turnRepairSpent = new Map<string, { sessionId: string; turnKey: string; token: string; at: number }>();
-/**
- * Chats whose last turn ended `failed` or `stalled` and which have produced nothing since.
- *
- * This is the shape of a stopped chat that no watchdog was ever going to report. The reload
- * budget's verdict — the one that reaches the desktop — is only reached by a chat that keeps
- * answering reloads with the same failure. A turn that simply ends and is followed by nothing
- * never gets there: there is no open turn left to watch, the app considers the matter closed,
- * and the conversation sits there.
- *
- * Both outcomes belong here. `failed` is a transport failure; `stalled` is what the page writes
- * for "no visible output and no progress for ten minutes" — a turn that produced nothing at all.
- * For the person watching they are the same standstill, and `stalled` is arguably the worse of
- * the two: a failed turn at least failed visibly, while this one looks like thinking until
- * somebody gives up waiting.
- *
- * Measured on one machine on 2026-09-13: four episodes, 24 + 53 + 76 + 45 minutes, 198 minutes
- * of a working day. The last of them ended when the user noticed, forty-five minutes in. And on
- * 2026-09-25 the `stalled` half: a turn opened at 17:31:59 after a resume, produced nothing, was
- * closed `stalled` at 17:44:44, and the chat then sat untouched with four workers still running
- * until its owner typed a word by hand.
- *
- * Cleared by the chat starting another turn, which is what "it carried on" looks like.
- */
-const failedTurnQuiet = new Map<string, { sessionId: string; outcome: 'failed' | 'stalled' }>();
-
-
-/**
- * The question of the newest recorded turn, when that turn has ended; otherwise null.
- *
- * Measured 2026-09-26 on a resumed prime whose turn ChatGPT lost server-side: the app ended it
- * `stalled` and reloaded, the reloaded page showed Stop for a few seconds before ChatGPT's own
- * "A network error occurred", and claimUnrecordedGeneration() opened a new turn for the same
- * question. That turn had no tool call and no output, stalled ten minutes later, earned another
- * reload, and so on — three rounds, 11:17 → 11:45 → 11:58 — and when the error reload was finally
- * spent, the automatic Continue was refused because the newest turn "has no confirmed local tool
- * call". Handing the page the settled question lets it tell a turn nobody recorded from the one
- * this app has just put down.
- */
-function settledQuestionOf(turns: TimelineTurns | undefined): string | null {
-  if (!turns) return null;
-  let newest: TimelineTurns[string] | null = null;
-  for (const turn of Object.values(turns)) if (!newest || turn.origin > newest.origin) newest = turn;
-  return newest && newest.endTime !== undefined && typeof newest.questionId === 'string' ? newest.questionId : null;
-}
+const turnRepairSpent = new Map<string, { sessionId: string; turnKey: string; token: string }>();
 
 async function assistantRepairSource(sessionId: string): Promise<NonNullable<Repair['assistantSource']>> {
   const [start] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start'] });
@@ -6614,32 +6481,6 @@ async function assistantRepairCurrent(conversationId: string, repair: Repair): P
  * episode key; the three-minute floor then protects distinct error/no-tab failures. Silence,
  * Goal and compaction carry their own schedules and therefore bypass that unrelated floor.
  */
-/**
- * How often one repair may be offered to a browser that never claims it.
- *
- * Re-offering an unclaimed repair is right — a claim can be missed, and the page that missed it
- * is the one that needs the reload — but it had no end. Every give-up in this file reads what the
- * page reports back, so a page that never returns reports nothing, no counter moves, and no
- * ceiling can fire. Measured on one machine on 2026-09-21: a chat whose tab was gone took 645
- * offers between 00:07 and 05:30, one every thirty seconds for five and a half hours, not one of
- * them ever confirmed, and it stopped only because the app was restarted. Other chats in the same
- * log took 9, 6 and 2. Deliberately generous, because a missed claim is ordinary and the remedy
- * is to offer again; this only ends the case where nothing is listening at all.
- */
-const UNCLAIMED_REPAIR_OFFERS = 10;
-const unclaimedRepairTold = new Set<string>();
-/**
- * Chats this app has concluded have no page, until one reports in again.
- *
- * The bound above ends one repair. It cannot end the supply of them: the silence watch mints a
- * fresh episode every time the chat goes quiet again, and each new episode arrives with its own
- * ten offers. So the verdict is remembered rather than re-derived, and it is lifted by the only
- * thing that can disprove it — the page itself polling for its chat's activity. Deliberately not
- * a timer, because nothing about elapsed time makes a discarded tab come back, and deliberately
- * in memory, because a restart has no page to speak of either and should ask again.
- */
-const pagelessChats = new Set<string>();
-
 function queueBrowserRecovery(
   conversationId: string,
   sessionId: string,
@@ -6657,30 +6498,14 @@ function queueBrowserRecovery(
   // assistant-error, goal, compaction — so refusing here refuses all of them, and none of them
   // needs its own exemption.
   if (!sessionId || !workerRecoveryAllowed(conversationId) || isChatBlocked(conversationId) || stopRequestedFor(conversationId)) return false;
-  // Already answered: this chat has no page, and a fresh episode cannot change that.
-  if (pagelessChats.has(conversationId)) return false;
   // The turn's one error reload, already spent. Checked before the episode and state guards
   // below because it outlives both: those forget a repair the moment its episode changes, and
   // the whole point here is that a *new* error on the same broken turn buys nothing.
   if (reason === 'assistant-error') {
     const spent = turnRepairSpent.get(conversationId);
     if (!assistantSource) return false;
-    // A reload that brought the answer back to work was not a failed remedy. The question does
-    // not move while one long answer runs, so without this a stream that dropped twice in an
-    // hour was treated as the same broken turn: measured 2026-09-26, a reload at 17:44 resumed
-    // a prime for ten minutes of tool calls, the stream dropped again at 17:58, and the chat was
-    // left on "Resume stream unavailable" for good. Only an attributed local tool call counts —
-    // a page cannot manufacture one.
-    // An answer whose final is already recorded is not broken, whatever its stream says next:
-    // measured the same day, "Resume stream unavailable" arrived three minutes after that
-    // prime's complete final report. That answer earns nothing further.
-    const progressed = spent !== undefined && !assistantSource.completed &&
-      (lastAttributedCallAt.get(conversationId) ?? 0) > spent.at;
-    if (spent?.sessionId === sessionId && assistantSource.key === spent.turnKey && !progressed) return false;
+    if (spent?.sessionId === sessionId && assistantSource.key === spent.turnKey) return false;
     if (spent) turnRepairSpent.delete(conversationId);
-    // Its finished repair carries the same episode name — same question, often the same
-    // wording — and would otherwise read below as this very failure already being handled.
-    if (progressed && repairsInFlight.get(conversationId)?.state === 'done') repairsInFlight.delete(conversationId);
   }
   const held = repairsInFlight.get(conversationId);
   if (held?.episode === episode) return false;
@@ -6822,8 +6647,6 @@ async function noteRecoveryObservations(
   const provenModel = selected?.conversationId === conversationId
     ? isProModel(selected.model, selected.reasoningEffort) ? 'pro' as const : 'other' as const
     : 'unknown' as const;
-  const provenDeliberate: { deliberate?: true } =
-    selected?.conversationId === conversationId && isDeliberateEffort(selected.reasoningEffort) ? { deliberate: true } : {};
   const unresolved = activeUntil.get(conversationId);
   if (!activity.terminal && unresolved?.model === 'unknown' && unresolved.sessionId === sessionId &&
       recorded?.conversationId === conversationId && (recorded.activeTurnId === unresolved.turnId || unresolved.thinkingFailed) && provenModel !== 'unknown') {
@@ -6864,10 +6687,7 @@ async function noteRecoveryObservations(
         if (item.kind === 'model_selection') selection = item;
         if (item.kind === 'turn_start' && item.turnId === liveTurn && previous?.turnId !== item.turnId) {
           turn = { turnId: item.turnId ?? null, model: selection?.kind === 'model_selection' && selection.model ?
-            isProModel(selection.model, selection.reasoningEffort) ? 'pro' : 'other' : provenModel,
-            ...(selection?.kind === 'model_selection' && selection.model
-              ? isDeliberateEffort(selection.reasoningEffort) ? { deliberate: true as const } : {}
-              : provenDeliberate) };
+            isProModel(selection.model, selection.reasoningEffort) ? 'pro' : 'other' : provenModel };
         }
         // A batch-local selection applies to its next start. Later starts reuse
         // the retained session selection, just as separate transport batches do.
@@ -6904,10 +6724,6 @@ async function noteRecoveryObservations(
     await inspectSilentChats(Date.now());
     armSilenceSweep();
   }
-  // Another turn is the chat carrying on, and the only thing that is. Read before the failure
-  // below rather than after it: one batch can carry a turn's start and its failed end, and
-  // clearing afterwards would file exactly that batch as a chat that kept going.
-  if (observations.some((item) => item.kind === 'turn_start')) failedTurnQuiet.delete(conversationId);
   const proTerminal = terminalGrant?.model === 'pro' && (activity.endedTurnId === terminalGrant.turnId ||
     (activity.terminal && !observations.some(item => item.kind === 'turn_end')));
   const awaitingSilenceRefresh = !!lastEnd && !!sessionId &&
@@ -6958,12 +6774,7 @@ async function noteRecoveryObservations(
     if (proTerminal) endActivity(conversationId);
     else if (lastEnd === 'unknown' && terminalGrant?.model === 'unknown' && terminalGrant.sessionId === sessionId) {
       // Loss of browser completion evidence does not change the last meaningful-work clock.
-    } else if ((lastEnd === 'failed' || lastEnd === 'stalled') && sessionId) {
-      // Without the mark a `stalled` turn took the `endActivity` branch below instead — it left
-      // the silence watch entirely, so nothing reached finishSilentChats, and nothing was said.
-      failedTurnQuiet.set(conversationId, { sessionId, outcome: lastEnd });
-      grantActivity(conversationId, sessionId, Math.min(Date.now(), activity.at ?? Date.now()));
-    }
+    } else if (lastEnd === 'failed' && sessionId) grantActivity(conversationId, sessionId, Math.min(Date.now(), activity.at ?? Date.now()));
     else endActivity(conversationId);
   }
 
@@ -7339,31 +7150,6 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
 /** Retires a confirmed one-shot silence recovery after the caller has handled any Worker slot. */
 function finishSilentChats(conversationIds: readonly string[]): void {
   for (const conversationId of conversationIds) {
-    // The last moment anything is watching this chat. If its final turn failed or stalled and
-    // nothing followed, this is where it would otherwise be put down in silence — see
-    // failedTurnQuiet. The wording says which of the two happened, because "ended in a transport
-    // failure" is not true of a turn that simply never spoke.
-    const quiet = failedTurnQuiet.get(conversationId);
-    if (quiet) {
-      const { sessionId, outcome } = quiet;
-      failedTurnQuiet.delete(conversationId);
-      void recordNote(
-        sessionId,
-        outcome === 'stalled'
-          ? 'This chat stopped: its last turn ran for ten minutes without producing anything and nothing ' +
-            'followed it. Send a message here to start a fresh turn, or continue in a new chat.'
-          : 'This chat stopped: its last turn ended in a transport failure and nothing followed it. ' +
-            'Send a message here to start a fresh turn, or continue in a new chat.'
-      ).catch(() => undefined);
-      noticeChatStopped(
-        'A chat stopped',
-        outcome === 'stalled'
-          ? 'Its last turn produced nothing and nothing followed. Send a message there to start a fresh turn.'
-          : 'Its last turn failed and nothing followed. Send a message there to start a fresh turn.',
-        sessionId
-      );
-      logWarn(`bridge: ${conversationId} stopped after a ${outcome} turn with nothing following it`);
-    }
     forgetActivity(conversationId);
     // Keep the existing exact receipt until genuine activity retires it. A large
     // replacement page can report Thinking failed after this maintenance pass.
@@ -7398,25 +7184,6 @@ const PICKUP_BACKOFF_MS = [2, 5, 10, 15].map((minutes) => minutes * 60_000) as [
  * The row is keyed to the exact `replyId` it was armed for. A newer final answer is a different
  * obligation and gets its own schedule; a discharged one takes its schedule with it.
  */
-/**
- * How many uncollected reloads pass before the chat's own timeline says what is happening.
- *
- * The schedule below runs for twelve hours and tells nobody in that time: every two, five, ten,
- * then fifteen minutes it reloads a page that is not collecting what it is offered, and the only
- * trace is one `info` line per attempt. If the page never collects — a turn that has frozen, a
- * document that will not take input — the schedule simply runs to its expiry and the chat sits.
- *
- * Measured on one machine on 2026-09-24: a chat whose turn had frozen was offered its queued
- * message, the page never collected it, the app reloaded on schedule, and the chat waited until
- * its owner noticed and typed into it. Three times in one morning, each time the person found it
- * before the app said anything, and each time one typed line started it again.
- *
- * Three attempts is seventeen minutes of the backoff: long enough that an ordinary slow pickup
- * has come and gone, short enough that the person is still at the machine.
- */
-const PICKUP_SILENT_ATTEMPTS = 3;
-const pickupStuckTold = new Set<string>();
-
 const pickupWatch = new Map<string, { replyId: string; dueAt: number; attempts: number; expiresAt: number }>();
 const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
 
@@ -7581,21 +7348,6 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
     watch.dueAt = now + PICKUP_BACKOFF_MS[Math.min(watch.attempts, PICKUP_BACKOFF_MS.length - 1)]!;
     queued = true;
     logInfo(`bridge: next automation/input step uncollected in ${reply.conversationId} — reload ${watch.attempts}`);
-    // And written where the user reads, once the reloads have stopped being plausible. The
-    // schedule goes on either way — a page can still come back hours later, and nothing here
-    // gives up on it — but the person who can end this in one line should not have to be the one
-    // who notices it.
-    if (watch.attempts >= PICKUP_SILENT_ATTEMPTS && !pickupStuckTold.has(reply.replyId)) {
-      pickupStuckTold.add(reply.replyId);
-      if (pickupStuckTold.size > 500) {
-        for (const old of [...pickupStuckTold].slice(0, 100)) pickupStuckTold.delete(old);
-      }
-      void recordNote(
-        reply.sessionId,
-        `This chat has a message waiting that its page will not take: ${watch.attempts} reloads and it was ` +
-          'never collected. The app keeps trying, but typing into the chat yourself starts it again immediately.'
-      ).catch(() => undefined);
-    }
   }
   return queued;
 }
@@ -8157,33 +7909,7 @@ async function takePendingRepairs(
     const unclaimed = repair.reason !== 'unattributed' && repairNeedsClaim(repair) && repair.state === 'handed' && !repair.claimed;
     if (repair.state !== 'queued' && !unclaimed) continue;
     if (now < repair.notBefore) continue;
-    if (unclaimed) {
-      repair.offers = (repair.offers ?? 1) + 1;
-      if (repair.offers > UNCLAIMED_REPAIR_OFFERS) {
-        // Nothing is listening. Say that, rather than go on offering into an empty room until
-        // some other subsystem happens to clear the entry — and say it as what it is: the
-        // verdict the reported-failure ceilings can never reach, because they need a page to
-        // report the failure.
-        repairsInFlight.delete(conversationId);
-        pagelessChats.add(conversationId);
-        const key = `${repair.sessionId}:${repair.episode}`;
-        if (!unclaimedRepairTold.has(key)) {
-          unclaimedRepairTold.add(key);
-          if (unclaimedRepairTold.size > 500) {
-            for (const old of [...unclaimedRepairTold].slice(0, 100)) unclaimedRepairTold.delete(old);
-          }
-          void recordNote(
-            repair.sessionId,
-            `Stopped trying to recover this chat: ${repair.offers - 1} attempts were offered to the browser and ` +
-              'none was picked up, so this chat has no page to reload. Open its tab again and recovery resumes.'
-          ).catch(() => undefined);
-          logWarn(
-            `bridge: ${conversationId} never claimed ${repair.offers - 1} ${repair.reason} repair offer(s) — no page; not offering again`
-          );
-        }
-        continue;
-      }
-    } else {
+    if (!unclaimed) {
       repair.state = 'handed';
       repair.token = randomBytes(9).toString('base64url');
       await updateRepairProgress(conversationId, repair, `Trying to reload chat to recover ${repairReason(repair)}…`);
@@ -8282,7 +8008,7 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       if (repair.reason === 'assistant-error') {
         // Charge the original question, never the replacement document seen at ACK time.
         if (repair.assistantSource) turnRepairSpent.set(conversationId,
-          { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token: repair.token, at: Date.now() });
+          { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token: repair.token });
       }
       await updateRepairProgress(
         conversationId,
@@ -8373,13 +8099,6 @@ function clearUnattributedIncident(): void {
   repairsInFlight.clear();
   lastBrowserRecoveryAt.clear();
   turnRepairSpent.clear();
-  pagelessChats.clear();
-  // The told-once set belongs to the incident state this tears down. Left behind, a give-up
-  // already reported keeps a later one silent — across a bridge restart in production, and
-  // across tests in the suite.
-  unclaimedRepairTold.clear();
-  pickupStuckTold.clear();
-  failedTurnQuiet.clear();
 }
 
 /**
@@ -8438,54 +8157,10 @@ async function deliverOne(): Promise<void> {
   // polling. Only that browser can put the new tab in the window the old one is in, and only
   // a tab it creates itself is guaranteed to be in a browser this extension is loaded in.
   try {
-    if (offerPlacement(command)) armPlacementFallback(command);
-    else await openFreshChatInBrowser(command);
+    if (!offerPlacement(command)) await openFreshChatInBrowser(command);
   } finally {
     scheduleDeliver();
   }
-}
-
-/**
- * How long the browser keeps the right to open a chat it was offered before this app does it.
- *
- * Placement is an optimisation: the page that asked for the handoff can put the successor in the
- * same window, which the operating system's opener cannot. When it works it is instant — three
- * handoffs measured on 2026-09-21 committed 4, 5 and 100 seconds after the brief was captured.
- * When it does not work it is silent, and silence used to cost a quarter of an hour: the offer's
- * only bound was the command's own lease, and for an automatic resume that lease is fifteen
- * minutes. Measured on 2026-09-22, the brief was captured at 04:32:53 and nothing happened at all
- * until the lease let go at 04:47:53 — this app then opened the chat itself and the handoff was
- * committed eight seconds later. One handoff in four that day.
- *
- * Long enough that a page which is merely slow still wins the race; short enough that a page
- * which is gone costs a minute rather than a quarter hour. Deliberately under COMMAND_DEADLINE_MS
- * as well, so a manual resume — which leases for exactly that — gets its fallback rather than
- * racing its own expiry.
- */
-const PLACEMENT_FALLBACK_MS = 60_000;
-
-/**
- * Opens the chat here when the browser was offered it and did nothing with it.
- *
- * Deliberately not a failure: the command keeps its lease, its ticket and its identity, and the
- * destination checkpoint still fences the bootstrap, so this is the same opening by a different
- * hand. A command that has since been redeemed, dropped or retired is left alone — `owner` is the
- * proof a page took it, and the lookup by id is what makes a stale timer harmless.
- */
-function armPlacementFallback(command: Command): void {
-  const timer = setTimeout(() => {
-    const current = commands.find((entry) => entry.id === command.id);
-    if (!current || current.owner !== null) return;
-    // Withdraw an offer nobody ever collected, so a late poll cannot open a second chat for a
-    // command this app is about to open itself.
-    delete current.placement;
-    logInfo(
-      `bridge: the browser did not open ${specKey(current.spec)} within ` +
-        `${Math.round(PLACEMENT_FALLBACK_MS / 1000)}s — opening it from here instead`
-    );
-    void openFreshChatInBrowser(current);
-  }, PLACEMENT_FALLBACK_MS);
-  timer.unref?.();
 }
 
 /**
@@ -9184,261 +8859,3 @@ function restoredCommandSnapshot(
 /**
  * Pure-with-respect-to-bridge-state reconstruction of the durable file.
  *
- * A settings stop/start deliberately retains in-memory commands; those are newer authority and
- * win every duplicate. Disk contributes only missing commands/receipts. Most importantly this
- * function never pushes into `commands`, arms a timer or publishes a receipt while later recovery
- * awaits can still fail.
- */
-function planCommandRestore(
-  saved: { version?: number; commands?: unknown; receipts?: unknown },
-  now: number
-): CommandRestorePlan | null {
-  const version = saved.version;
-  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 || !Array.isArray(saved.commands)) return null;
-
-  const plannedCommands = [...commands];
-  const plannedReceipts = commandReceipts
-    .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
-    .slice(-MAX_COMMAND_RECEIPTS);
-  const receiptIds = new Set(plannedReceipts.map((receipt) => receipt.id));
-  if (version !== 1 && Array.isArray(saved.receipts)) {
-    for (const raw of saved.receipts as Array<Partial<CommandReceipt>>) {
-      const receipt = restoredReceipt(raw, now);
-      if (!receipt || receiptIds.has(receipt.id)) continue;
-      receiptIds.add(receipt.id);
-      plannedReceipts.push(receipt);
-    }
-    if (plannedReceipts.length > MAX_COMMAND_RECEIPTS) {
-      plannedReceipts.splice(0, plannedReceipts.length - MAX_COMMAND_RECEIPTS);
-    }
-  }
-
-  const retainedKeys = new Set(plannedCommands.map((command) => specKey(command.spec)));
-  const expiredRevivals: Array<{
-    id: string;
-    spec: Extract<CommandSpec, { type: 'revive' }>;
-  }> = [];
-  const resumeTokens: Array<{ sessionId: string; token: string }> = plannedCommands
-    .filter(
-      (
-        command
-      ): command is Command & {
-        spec: Extract<CommandSpec, { type: 'resume' }>;
-      } => command.spec.type === 'resume'
-    )
-    .map((command) => ({
-      sessionId: command.spec.sessionId,
-      token: command.spec.token
-    }));
-  const durableCandidates = new Map<
-    string,
-    { raw: Partial<DurableCommandRecord>; spec: CommandSpec; createdAt: number }
-  >();
-  let restored = 0;
-
-  for (const raw of saved.commands as Array<Partial<DurableCommandRecord>>) {
-    const specRaw = raw.spec as Partial<CommandSpec> | undefined;
-    if (!specRaw || typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 64) continue;
-    const spec = restoredCommandSpec(version, specRaw);
-    if (!spec) continue;
-    const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : 0;
-    const key = specKey(spec);
-    // In-memory state survived a settings stop/start and is newer authority than the disk
-    // snapshot it produced. A stale old durable row for the same worker must never cancel or
-    // replace that newer live transport merely because both have the same friendly key.
-    if (retainedKeys.has(key) || receiptIds.has(raw.id)) continue;
-    const prior = durableCandidates.get(key);
-    // Corrupt/legacy files can contain two incarnations of one transport key. Pick authority
-    // first, then apply TTL semantics to that one record only. Newer createdAt wins; a later
-    // record wins a tie so reconstruction is deterministic for whole-file duplicates.
-    if (!prior || createdAt >= prior.createdAt) durableCandidates.set(key, { raw, spec, createdAt });
-  }
-
-  for (const { raw, spec, createdAt } of durableCandidates.values()) {
-    if (spec.type === 'resume') resumeTokens.push({ sessionId: spec.sessionId, token: spec.token });
-    const persistedLeased = version !== 1 && raw.phase === 'leased';
-    // The broker cannot yet say whether a restored wake was delivered, so disk rows get the
-    // longer budget here; the deadline re-armed below applies the exact one.
-    const stale = spec.type === 'revive'
-      ? now - createdAt >= REVIVAL_ACTIVITY_MS
-      : now - createdAt > COMMAND_TTL_MS;
-    if (stale) {
-      if (spec.type === 'revive') expiredRevivals.push({ id: raw.id!, spec });
-      continue;
-    }
-
-    const continuation = spec.type === 'resume' ? continuationByToken(spec.token) : null;
-    const legacyAlreadyClaimed =
-      version === 1 && continuation !== null &&
-      (continuation.state === 'claimed' || continuation.state === 'committing' || continuation.state === 'committed');
-    const leased = persistedLeased || legacyAlreadyClaimed;
-    let claimedAt = leased && typeof raw.claimedAt === 'number' && Number.isFinite(raw.claimedAt) ? raw.claimedAt : null;
-    if (leased && claimedAt === null) claimedAt = now;
-    if (claimedAt !== null && claimedAt > now + COMMAND_DEADLINE_MS) claimedAt = now;
-    plannedCommands.push({
-      id: raw.id!,
-      spec,
-      createdAt,
-      claimedAt,
-        timer: null,
-      lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
-      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null
-    });
-    restored += 1;
-  }
-
-  // Retained commands normally win over disk, but the same absolute waking deadline still applies.
-  // A newer retained revival is not touched by an older expired disk row because disk candidates
-  // for its key were discarded above before expiry was considered.
-  const expiredRetainedRevivalIds = new Set<string>();
-  for (const command of plannedCommands) {
-    if (command.spec.type !== 'revive' || now < revivalDeadlineAt(command)) continue;
-    expiredRevivals.push({ id: command.id, spec: command.spec });
-    expiredRetainedRevivalIds.add(command.id);
-  }
-  const commandsAfterExpiredRevival = plannedCommands.filter(
-    (command) => !expiredRetainedRevivalIds.has(command.id)
-  );
-
-  return {
-    commands: commandsAfterExpiredRevival,
-    receipts: plannedReceipts.slice(-MAX_COMMAND_RECEIPTS),
-    expiredRevivals,
-    resumeTokens,
-    restored
-  };
-}
-
-/**
- * Reloads commands left over from a previous run.
- *
- * Ordinary commands older than the TTL are discarded rather than acted on: reopening the app
- * the next morning must not spray yesterday's chats across the browser. A revival is stricter:
- * after thirty seconds it releases the broker's `waking` reservation and the worker becomes
- * sleeping/revivable again. Version 2 persists the queued/leased phase and document owner; version
- * 1 is migrated conservatively, including resume commands whose continuation WAL survived.
- */
-export async function restoreCommands(): Promise<void> {
-  const saved = await readDurable<{
-    version?: number;
-    commands?: unknown;
-    receipts?: unknown;
-  }>(COMMANDS_STATE);
-  if (!saved) return;
-  const now = Date.now();
-  const plan = planCommandRestore(saved, now);
-  if (!plan) return;
-
-  if (plan.expiredRevivals.length > 0) {
-    let brokerRelevant = false;
-    for (const expired of plan.expiredRevivals) {
-      const revive = expired.spec;
-      // Run id was already validated above. Check the exact conversation too so a stale command
-      // for an earlier binding cannot knock down a newer wake for the same friendly worker id.
-      // `brokerRelevant` deliberately survives a prior failed recovery attempt: that attempt may
-      // already have moved the live worker back to sleeping while the durable swarm is still
-      // waking. A later startup must fsync the *current* broker state before it may prune the old
-      // command, even though pendingWorkerRevivals() no longer lists it.
-      if (agentForConversation(revive.conversationId) !== revive.agent) continue;
-      brokerRelevant = true;
-      const owed = pendingWorkerRevivals().find(
-        (entry) => entry.id === revive.agent && entry.conversationId === revive.conversationId && entry.runId === revive.runId
-      );
-      if (!owed) continue;
-      failWorkerRevival(revive.agent, 'its durable revival expired while the app was not running', revive.runId);
-    }
-
-    if (brokerRelevant) {
-      // Crash order is load-bearing: durable `sleeping` first, command pruning second. If the
-      // command vanished first and the process died here, the next startup would restore
-      // `waking` with no matching old command and recreate the fresh-TTL bug.
-      let persisted = false;
-      try {
-        persisted = await persistCriticalSwarmNow();
-      } catch (err) {
-        throw new Error(
-          `could not durably settle expired worker revival(s); bridge startup must retry before pruning them — ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-      if (!persisted) {
-        throw new Error('could not durably settle expired worker revival(s); bridge startup must retry before pruning them');
-      }
-    }
-
-  }
-
-  // One explicit durable rewrite from the local plan. No live bridge state participates in this
-  // snapshot, so an overlapping callback/request cannot smuggle a half-restored generation onto
-  // disk. If storage fails after broker reconciliation, the safe old disk row remains and
-  // durable.ts retains this exact newer generation for retry; publishing the already-reconciled
-  // plan in memory is safe because admission is still fenced by bridgeRecovering.
-  let rewriteDurable = true;
-  try {
-    await writeDurableNow(COMMANDS_STATE, restoredCommandSnapshot(plan.commands, plan.receipts, now));
-    rewriteDurable = false;
-  } catch (err) {
-    logWarn(`bridge: could not persist reconstructed command state — ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  // This is the only publication point of restore. Everything above operated on local arrays;
-  // everything below may again use ordinary live command helpers and timers.
-  commands = plan.commands;
-  commandReceipts = plan.receipts;
-  for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
-  rearmRetainedCommandDeadlines();
-  if (plan.restored > 0) {
-    logInfo(`bridge: restored ${plan.restored} chat command(s) from the previous run`);
-    changed();
-  }
-  if (rewriteDurable) persistCommands();
-  // Recovery may have just turned the last expired `waking` worker back into a stopped worker.
-  // Do not resurrect the old global active claim merely because no request exists yet to run
-  // the usual dispatcher/stale-sweep release hook.
-  releaseQuiescentRun();
-}
-
-/** Test seam. */
-export function resetBridgeForTests(): void {
-  clearCompanionDiagnostics();
-  for (const command of commands) if (command.timer) clearTimeout(command.timer);
-  if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
-  browserPresenceTimer = null;
-  commands = [];
-  commandReceipts = [];
-  commandRetirementsAwaitingBroker.clear();
-  commandWrites.clear();
-  commandRedeems.clear();
-  bridgeRecovering = false;
-  bridgeShutdownRequested = false;
-  bridgeError = null;
-  clearUnattributedIncident();
-  activeUntil.clear();
-  awaitingReturn.clear();
-  lastAttributedCallAt.clear();
-  fiberHealth.clear();
-  markedReplacementNotices.clear();
-  refusalNoticedAt.clear();
-  pickupWatch.clear();
-  compactionWatch.clear();
-  // Re-armed rather than cleared: the seam stands in for a process that has just started
-  // serving, which is exactly what the fence measures. Clearing it would leave the watchdog
-  // permanently off in every suite that starts the bridge once and resets between tests.
-  pickupWatchFloor = Date.now();
-  compactionWatchFloor = pickupWatchFloor;
-  resetContinuationsForTests();
-  sessionTokens.clear();
-  openInBrowser = null;
-  if (browserLaunchTimer) clearTimeout(browserLaunchTimer);
-  browserLaunchTimer = null;
-  lastBrowserLaunchAt = 0;
-  lastSeenAt = null;
-  extensionVersion = null;
-  announcedExtensions.clear();
-  extensionBuildSeenAt.clear();
-  versionWarned = false;
-  requestWindow = { start: Date.now(), count: 0 };
-}
-
-export function bridgePort(): number | null {
-  return port;
-}
