@@ -49,6 +49,7 @@
 .plugin-refresh-guide { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; font-size: calc(13px * var(--text-scale, 1)); line-height: 1.6; }
 .plugin-refresh-guide p { flex: 1 1 380px; margin: 0; color: var(--soft); }
 .plugin-refresh-guide .btn { color: var(--ink); font-size: calc(13px * var(--text-scale, 1)); }
+.plugin-refresh-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .plugin-section-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin: 28px 0 14px; }
 .plugin-section-head h2 { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; margin: 0; font-size: calc(16px * var(--text-scale, 1)); font-weight: 650; letter-spacing: -.15px; }
 .plugin-count, .plugin-section-head > .muted { color: var(--soft); font-size: calc(11px * var(--text-scale, 1)); font-weight: 400; letter-spacing: 0; }
@@ -1923,6 +1924,13 @@ input[readonly] {
   grid-template-rows: auto minmax(0, 1fr) auto auto auto;
   background: var(--page); border: 0; border-radius: 0; box-shadow: none;
 }
+.card.is-session.is-extension-waiting > :not(#chatBody):not(#chatSettingsBtn) { display: none !important; }
+.card.is-session.is-extension-waiting > #chatBody { grid-row: 1 / -1; padding: 0; overflow: hidden; }
+.card.is-session.is-extension-waiting > #chatBody > :not(#extensionConnectionGate) { display: none !important; }
+.extension-connection-gate { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 32px; text-align: center; color: var(--soft); }
+.extension-connection-gate[hidden] { display: none; }
+.extension-connection-gate p { margin: 0; font-size: calc(18px * var(--text-scale, 1)); }
+.extension-connection-gate .btn { min-width: 88px; }
 /* Disclosure/history height changes must not take scrollbar width from the prose. */
 #chatBody { padding: 24px max(24px, calc((100% - 800px) / 2)); scrollbar-gutter: stable; }
 /* Keyed reconciliation owns the reader anchor; avoid a second browser adjustment. */
@@ -2025,6 +2033,15 @@ input[readonly] {
 .card.is-session > .composer-dock { grid-row: 3; }
 .card.is-session > #composer { grid-row: 4; }
 .card.is-session > #chatFoot { grid-row: 5; }
+
+.refresh-plugins-button { min-height: 32px; padding: 6px 11px; border: 1px solid var(--edge); border-radius: 9px; background: var(--card); white-space: nowrap; }
+.refresh-plugins-button:disabled { color: var(--faint); background: var(--hover); border-color: var(--line); cursor: default; opacity: .72; }
+.refresh-plugins-button:disabled .ico { animation: working-pulse 1.4s ease-in-out infinite; }
+.plugin-refresh-busy { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 72px; color: var(--soft); font-size: calc(14px * var(--text-scale, 1)); font-weight: 550; }
+.plugin-refresh-busy .ico { width: 18px; height: 18px; animation: working-pulse 1.4s ease-in-out infinite; }
+.card.is-session.is-plugin-refreshing > #composer { display: none !important; }
+.card.is-session.is-plugin-refreshing > .composer-dock { width: calc(100% - 48px); max-width: 860px; margin: 14px auto 24px; border: 1px solid var(--composer-edge); border-radius: 22px; box-shadow: 0 8px 28px rgb(0 0 0 / 7%); }
+.card.is-session.is-plugin-refreshing > .composer-dock > :not(#pluginRefreshBusy) { display: none !important; }
 
 /* ------------------------------------------------------- session list */
 
@@ -2939,6 +2956,7 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
   .app > header .live em { display: none; }
   [data-panel='home'] { grid-template-rows: none; }
   .composer { width: calc(100% - 32px); padding: 14px 12px 10px; }
+  .card.is-session.is-plugin-refreshing > .composer-dock { width: calc(100% - 32px); }
   #chatBody { padding: 20px 22px; }
 }
 
