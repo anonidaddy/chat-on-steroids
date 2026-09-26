@@ -1,5 +1,4 @@
 import type { InputEntry } from './input.js';
-import { estimateTokens } from '../../shared/session.js';
 import { browserInputModel } from '../../shared/input.js';
 import { getSession, observeSessionModel, readAsset, readEvents, upsertMessageEvent, writeAsset } from './store.js';
 import { validateInputImages } from './input-images.js';
@@ -29,7 +28,6 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
     // Browser delivery uses its exact native key, so a later page echo updates this row.
     // Tool delivery has no native user row and keeps the stable input id as its key.
     messageId, inputId: entry.id, inputDelivery: offered ? 'offered' as const : 'confirmed' as const, authoredText: entry.text,
-    wireTokenEstimate: estimateTokens(text),
     ...(messageId.startsWith('input:') && entry.toolTurnId ? { turnId: entry.toolTurnId } : {}),
     ...(entry.attachments?.length && entry.transportIntent !== 'tool' ? { attachments: entry.attachments } : {}),
     // Injection does not change the running model. Only the native send path verifies

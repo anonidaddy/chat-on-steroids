@@ -10,11 +10,11 @@ import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
-import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, questionHasMcpCall, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage } from './store.js';
+import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage } from './store.js';
 import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
-import { logInfo, logWarn } from '../logger.js';
+import { logInfo } from '../logger.js';
 import { noteChatOrigin } from './recorder.js';
 import { isAstraModel, isProModel } from '../../shared/chat-models.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
@@ -23,7 +23,7 @@ import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
-import { recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
+import { PROVIDER_HOLD_RECOVERY_MESSAGE, recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -60,7 +60,7 @@ const entrySchema = inputArgs.extend({
   /** The active turn at admission; its final may already be waiting in the browser journal. */
   queuedTurn: z.object({ conversationId: z.string().min(1).max(256), turnId: z.string().min(1).max(256) }).optional(),
   /** Shared unfinished-response fallback belongs to this question in every mode. */
-  recovery: z.object({ questionId: z.string(), episode: z.string().max(200).optional(), pro: z.boolean(), busyUntil: z.number(), phase: z.enum(['ready', 'stopping', 'reloading', 'resumed']), reloadOwner: z.string().optional() }).optional(),
+  recovery: z.object({ questionId: z.string(), episode: z.string().max(200).optional(), pro: z.boolean(), busyUntil: z.number(), phase: z.enum(['ready', 'stopping', 'reloading', 'resumed']), reloadOwner: z.string().optional(), providerHold: z.literal(true).optional() }).optional(),
   /** Exact tool-free turn this explicit browser correction may interrupt. */
   directTurn: z.object({ id: z.string().min(1).max(256), startedAt: z.number() }).optional(),
   finishOwner: z.object({ turnId: z.string().min(1).max(256), periodic: z.boolean(), mode: z.enum(['goal', 'loop']).optional(), userRequested: z.boolean().optional() }).optional(),
@@ -108,7 +108,7 @@ export interface ToolInputBatch {
 }
 export interface InputActivity { possible: boolean; exact: boolean; model?: 'pro' | 'other' | 'unknown'; turnId?: string }
 type InputDeliveryHooks = {
-  recoveryAllowed?: (sessionId: string, conversationId: string) => boolean;
+  recoveryAllowed?: (sessionId: string, conversationId: string, kind?: 'provider-hold') => boolean;
   activity?: (session: SessionSummary) => InputActivity;
   wakeDecision?: (entry: Readonly<InputEntry>, signal: AbortSignal) => Promise<void>;
   bindHelper?: (conversationId: string, sourceSessionId: string | null) => Promise<void>;
@@ -201,9 +201,6 @@ async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
     (entry.mode === 'auto' && !entry.finishOwner && entry.purpose !== 'decision' && entry.state === 'queued' &&
       entry.owner === null && entry.offeredAt === undefined && policy.settled));
 }
-/** The last release reason said out loud per ticket, so a loop is visible without being noisy. */
-const recoveryReleaseTold = new Map<string, string>();
-
 const inputListeners = new Set<() => void>();
 export function onInputChange(listener: () => void): () => void {
   inputListeners.add(listener);
@@ -1018,22 +1015,8 @@ export function finishNeedsBrowserInput(sessionId: string): Promise<boolean> {
 // Control-only turn_end observations (including our own Stop) are not renewed work.
 const RECOVERY_WORK_KINDS: import('../../shared/session.js').SessionEvent['kind'][] =
   ['user_message', 'assistant_message', 'tool_call', 'page_tool', 'turn_start'];
-/**
- * Hands a recovery ticket back to the queue, keeping the reason it came back.
- *
- * The ticket surviving is the point — a Continue that was never authorized is still owed, and its
- * pickup budget is deliberately retained. What was lost with it was the explanation: the page tells
- * the app exactly why it could not send, `failBrowserInput` carried that string, and this dropped it
- * on the floor while every other branch there keeps it. So a row could be claimed and released over
- * and over with nothing written down anywhere.
- *
- * Measured on 2026-09-26: one recovery row claimed twelve times in three minutes, back to `queued`
- * each time, no `error` on the receipt and not one line in the log. The loop was only visible at all
- * because the claims themselves are logged.
- */
-function releaseRecoveryClaim(row: InputEntry, error?: string): InputEntry {
+function releaseRecoveryClaim(row: InputEntry): InputEntry {
   return { ...row, state: 'queued', owner: null, offeredAt: undefined, completedTurnId: undefined,
-    ...(error ? { error: error.slice(0, 200) } : {}),
     recovery: { ...row.recovery!, phase: row.recovery!.phase === 'ready' ? 'ready' : 'resumed' } };
 }
 async function recoveryCurrent(row: InputEntry): Promise<boolean> {
@@ -1050,7 +1033,9 @@ async function recoveryInvalidReason(row: InputEntry): Promise<string | null> {
   if (!row.recovery || !row.sessionId || !boundary) return 'the recovery source is missing';
   if (Date.now() - row.createdAt >= 12 * 60 * 60_000) return 'the twelve-hour recovery window expired';
   const unavailable = () => isChatBlocked(boundary.conversationId) ? 'this chat is blocked' :
-    deliveryHooks?.recoveryAllowed?.(row.sessionId!, boundary.conversationId) !== true ? 'automatic continuation is off or paused' : null;
+    deliveryHooks?.recoveryAllowed?.(row.sessionId!, boundary.conversationId, row.recovery?.providerHold ? 'provider-hold' : undefined) !== true
+      ? row.recovery?.providerHold ? 'provider hold recovery is no longer allowed' : 'automatic continuation is off or paused'
+      : null;
   const reason = unavailable();
   if (reason) return reason;
   const session = await getSession(row.sessionId);
@@ -1062,7 +1047,7 @@ async function recoveryInvalidReason(row: InputEntry): Promise<string | null> {
   const [end] = await readRecentEvents(row.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
   if (end?.turnId !== boundary.turnId) return 'the recorded turn changed';
   if (end.kind === 'turn_end' && end.outcome === 'stopped') return 'the user stopped the turn';
-  if (!await questionHasMcpCall(row.sessionId, boundary.conversationId, boundary.turnId)) return 'the source has no confirmed local tool call';
+  if (!row.recovery.providerHold && !await turnHasMcpCall(row.sessionId, boundary.conversationId, boundary.turnId)) return 'the source has no confirmed local tool call';
   if (await readCompletedFinal(row.sessionId, boundary.conversationId)) return 'the complete answer arrived';
   const question = await readLatestUserMessage(row.sessionId, boundary.turnId);
   const [work] = await readRecentEvents(row.sessionId, 1, { kinds: RECOVERY_WORK_KINDS });
@@ -1073,55 +1058,67 @@ async function recoveryInvalidReason(row: InputEntry): Promise<string | null> {
   return (await getSession(row.sessionId))?.conversationId === boundary.conversationId ? null : 'the session moved to another chat';
 }
 
-const recoveryRefusalsTold = new Set<string>();
-
 /** Shared unfinished-response ticket; mode policy belongs to the bridge hook. */
 export function fileRecoveryInput(sessionId: string, conversationId: string, turnId: string, pro: boolean,
   currentOwner: () => boolean, busyUntil = Date.now() + recoveryBusyMs(pro), episode = `turn:${turnId}`): Promise<boolean> {
-  // Every refusal says why, once per turn and reason. Silent refusals cost a stopped chat its
-  // only automatic restart with nothing anywhere naming the cause (2026-09-26: a prime's restart
-  // was refused twice and the log said only that the chat had stopped).
-  const refused = (why: string): false => {
-    const key = `${conversationId}:${turnId}:${why}`;
-    if (!recoveryRefusalsTold.has(key)) {
-      recoveryRefusalsTold.add(key);
-      if (recoveryRefusalsTold.size > 500) recoveryRefusalsTold.delete(recoveryRefusalsTold.values().next().value!);
-      logInfo(`input: automatic Continue for ${conversationId} not filed — ${why} (turn ${turnId})`);
-    }
-    return false;
-  };
   return serial(async () => {
     const current = await load();
     // Never overtake authored input, retry an ambiguous send, or reuse a spent source.
-    if (current.some(row => row.sessionId === sessionId && !terminal(row))) return refused('an earlier message of this session is still awaiting delivery');
+    if (current.some(row => row.sessionId === sessionId && !terminal(row))) return false;
     const question = await readLatestUserMessage(sessionId, turnId);
     const [work] = await readRecentEvents(sessionId, 1, { kinds: RECOVERY_WORK_KINDS });
-    if (!question?.messageId) return refused('the session has no recorded question to continue');
-    if (!work) return refused('the session has no recorded work to continue');
-    if (!currentOwner()) return false;
-    // One live ticket per turn, and never a replay of an authorized send — but a ticket that ended
-    // without ever reaching Send answered nothing and must not stand in for one. Watched live on
-    // 2026-09-23: a rescue was filed at 20:32:35 when the chat stopped, and cancelled fifteen
-    // seconds later as "the source received new work" — correct, the chat had resumed by itself.
-    // Two minutes after that the same turn broke again: its error reload was spent, three silence
-    // reloads came back with the same failure, the watch gave up, and this check refused the
-    // second rescue on the strength of the cancelled first. The chat sat until its owner typed.
-    // `sendAuthorizedAt` keeps its own veto: an authorized send is ambiguous forever and is never
-    // retried, whatever state its row reached.
+    if (!question?.messageId || !work || !currentOwner()) return false;
     if (current.some(row => row.sessionId === sessionId && row.recovery && row.silenceBoundary?.turnId === turnId &&
-        (row.sendAuthorizedAt !== undefined ||
-          (!terminal(row) && (!row.recovery.episode || row.recovery.episode === episode))))) return refused('this turn already has its restart');
+        (!row.recovery.episode || row.recovery.episode === episode || row.sendAuthorizedAt !== undefined))) return false;
     const now = Date.now();
     const row: InputEntry = { id: randomUUID(), sessionId, conversationId, owner: null, state: 'queued',
       mode: 'after-turn', dueAt: now, createdAt: now, model: null, reasoningEffort: null,
       text: recoveryMessage(),
       recovery: { questionId: question.messageId, episode, pro, busyUntil, phase: 'ready' },
       silenceBoundary: { turnId, conversationId, workSeq: workSequence(work), acceptedAt: now } };
-    if (!await recoveryCurrent(row)) {
-      const why = await recoveryInvalidReason(row);
-      return refused(why ?? 'a local tool call is still running');
-    }
-    if (!currentOwner()) return false;
+    if (!await recoveryCurrent(row) || !currentOwner()) return false;
+    await commit(append(current, row));
+    return true;
+  });
+}
+
+/**
+ * The provider itself says this exact native response is parked. File one immediate browser
+ * continuation against that turn; unlike silence recovery, the hold is its own authority and
+ * does not require a local tool call or the optional Automatic Continue setting.
+ */
+export function fileProviderHoldInput(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const session = await getSession(sessionId);
+    if (!session || session.conversationId !== conversationId || session.activeTurnId !== turnId) return false;
+    // These chats deliberately have another recovery owner, or none. Treat the hold as handled
+    // so a still-mounted provider component does not keep asking this outbox to create work.
+    if (session.origin?.kind === 'worker' || session.origin?.kind === 'helper' || isChatBlocked(conversationId)) return true;
+    if (inFlightToolCalls(conversationId) > 0) return false;
+    const question = await readLatestUserMessage(sessionId, turnId);
+    const [work] = await readRecentEvents(sessionId, 1, { kinds: RECOVERY_WORK_KINDS });
+    if (!question?.messageId || !work) return false;
+    // The durable row is also the once-per-hold receipt. A reload on the same parked turn
+    // must not mint another retry even if the first row later became terminal pre-send.
+    if (current.some(row => row.sessionId === sessionId && row.recovery?.providerHold === true &&
+        row.silenceBoundary?.turnId === turnId)) return true;
+    // If this question is itself the provider-hold continuation we already sent, stop here.
+    // Its response may enter the same provider state, but one provider incident gets one retry.
+    if (current.some(row => row.sessionId === sessionId && row.recovery?.providerHold === true &&
+        row.state === 'sent' && row.messageId === question.messageId)) return true;
+    if (current.some(row => row.sessionId === sessionId && !terminal(row))) return false;
+    const now = Date.now();
+    const row: InputEntry = {
+      id: randomUUID(), sessionId, conversationId, owner: null, state: 'queued', mode: 'after-turn',
+      dueAt: now, createdAt: now, model: null, reasoningEffort: null, text: PROVIDER_HOLD_RECOVERY_MESSAGE,
+      recovery: { questionId: question.messageId, episode: `provider-hold:${turnId}`, pro: false,
+        busyUntil: now, phase: 'ready', providerHold: true },
+      silenceBoundary: { turnId, conversationId, workSeq: workSequence(work), acceptedAt: now, listenUntil: now, nativeBusy: true }
+    };
+    if (!await recoveryCurrent(row)) return false;
+    const latestSession = await getSession(sessionId);
+    if (!latestSession || latestSession.conversationId !== conversationId || latestSession.activeTurnId !== turnId) return false;
     await commit(append(current, row));
     return true;
   });
@@ -1245,9 +1242,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean; providerHold?: true }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean; providerHold?: true }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1261,7 +1258,8 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
         const silenceTurnId = entry.silenceBoundary?.turnId ?? (end?.kind === 'turn_end' && end.outcome === 'failed' &&
           end.reason === 'thinking_failed' && end.turnId && await eligibleStageEnd(entry) === end.turnId ? end.turnId : undefined);
         result.push({ id: entry.id, conversationId,
-          ...(entry.recovery ? { recovery: { questionId: entry.recovery.questionId, stop: entry.silenceBoundary?.nativeBusy === true && entry.recovery.phase === 'ready' } } : {}),
+          ...(entry.recovery ? { recovery: { questionId: entry.recovery.questionId, stop: entry.silenceBoundary?.nativeBusy === true && entry.recovery.phase === 'ready',
+            ...(entry.recovery.providerHold ? { providerHold: true as const } : {}) } } : {}),
           ...(silenceTurnId ? { silenceTurnId } : {}),
           ...(entry.directTurn ? { directTurn: entry.directTurn } : {}),
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
@@ -1541,14 +1539,7 @@ export function failBrowserInput(id: string, owner: string, error: string): Prom
     const entry = current.find((row) => row.id === id && row.owner === owner && row.state === 'browser');
     if (!entry || companionOf(current, entry)) return false;
     if (entry.recovery && entry.requiresAuthorization === true && entry.sendAuthorizedAt === undefined) {
-      // Said once per reason, not once per attempt: the pickup schedule can hand the same ticket to
-      // the same page every few seconds, and an unbounded log is its own kind of silence.
-      if (recoveryReleaseTold.get(entry.id) !== error) {
-        recoveryReleaseTold.set(entry.id, error);
-        if (recoveryReleaseTold.size > 200) for (const old of [...recoveryReleaseTold.keys()].slice(0, 50)) recoveryReleaseTold.delete(old);
-        logWarn(`input ${entry.id}: the browser could not send this recovery message — ${error.slice(0, 160)}`);
-      }
-      await commit(current.map(row => row === entry ? releaseRecoveryClaim(row, error) : row));
+      await commit(current.map(row => row === entry ? releaseRecoveryClaim(row) : row));
       return true;
     }
     // The document reports this only while its native Send has never been attempted.
