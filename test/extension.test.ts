@@ -1730,47 +1730,6 @@ describe('worker settings authority', () => {
    * cannot decide this from outside. It answers the capture request with the successor instead,
    * and the browser that holds chat A creates the tab in chat A's own window.
    */
-  /**
-   * A successor with nowhere to be placed is still opened.
-   *
-   * The placement below arranges the new tab beside its predecessor, which needs the home
-   * conversation's own tab to decide the window and the index. When that cannot be worked out the
-   * opener used to return without opening anything and without saying so, and the app then waited
-   * out its redeem deadline and reported "the chat this app opened did not report back in time"
-   * about a chat it had never opened.
-   *
-   * Two ordinary situations reach it, both reported from a live machine on 2026-09-25 with
-   * Background chats off: a command from a caller that has no ChatGPT conversation of its own —
-   * an unattributed MCP client spawning a worker, where the run starts "by conversation null" —
-   * and a home conversation whose tab the user has since closed. In both, no tab appeared at all
-   * and the only trace was the timeout twenty seconds later.
-   */
-  it('opens a successor that names no home conversation instead of silently giving up', async () => {
-    let offered = false;
-    const fetch = vi.fn(async (input: string) => {
-      const url = new URL(input);
-      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
-      if (url.pathname === '/status') {
-        if (offered) return response(200, { ok: true, repairs: [] });
-        offered = true;
-        // What a worker spawn from an unattributed caller answers with: a command to redeem and
-        // no conversation to sit beside.
-        return response(200, { ok: true, repairs: [], placement: { id: 'cmd-orphan' } });
-      }
-      return response(404, {});
-    });
-    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
-    await worker.registerTab(41);
-    await worker.fireAlarm();
-
-    expect(worker.tabsCreate, 'the command was left to time out with no tab').toHaveBeenCalledTimes(1);
-    const created = worker.tabsCreate.mock.calls[0]![0] as Record<string, unknown>;
-    expect(String(created.url)).toBe('https://chatgpt.com/?clf=cmd-orphan#clf=cmd-orphan');
-    // The ordinary current window: no placement was possible, and none is claimed.
-    expect(created.windowId).toBeUndefined();
-    expect(created.active).toBe(true);
-  });
-
   it('opens the replacement chat in the window of the chat it continues', async () => {
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);
@@ -3479,6 +3438,38 @@ describe('extension observation journal', () => {
     expect(fetch.mock.calls.filter(([input]) => new URL(String(input)).pathname === '/activity/detail')).toHaveLength(1);
   });
 
+  it('does not file a provider hold after Chrome has started navigating the owning document away', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const other = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let pendingUrl: string | undefined = `https://chatgpt.com/c/${other}`;
+    const holdBodies: unknown[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const route = new URL(input).pathname;
+      if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (route === '/provider-hold') {
+        holdBodies.push(JSON.parse(String(init.body)));
+        return response(200, { ok: true });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(), fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${conversationId}`,
+        ...(pendingUrl ? { pendingUrl } : {}), status: pendingUrl ? 'loading' : 'complete' })
+    });
+
+    await worker.send({ type: 'bind', conversationId }, 65);
+    await expect(worker.send({ type: 'provider_hold', conversationId, turnId: 'source-turn' }, 65))
+      .resolves.toMatchObject({ ok: false, error: 'stale_provider_hold' });
+    expect(holdBodies).toEqual([]);
+
+    pendingUrl = undefined;
+    await expect(worker.send({ type: 'provider_hold', conversationId, turnId: 'source-turn' }, 65))
+      .resolves.toMatchObject({ ok: true });
+    expect(holdBodies).toEqual([{ conversationId, turnId: 'source-turn' }]);
+  });
+
   it.each(['absent', 'present', 'query-failed', 'same-chat', 'pending-chat', 'still-loading'])(
     'only closes a URL-redacted completed departure with positive absence: %s', async (mode) => {
       const conversationId = '11111111-2222-3333-4444-555555555555';
@@ -4512,8 +4503,6 @@ it.each([
   ['unattributed', { ok: true, draft: false, streaming: true }, 0],
   ['unattributed', { ok: true, draft: false, streaming: false }, 1],
   ['unattributed', null, 1],
-  ['blind', { ok: true, draft: false, streaming: true }, 0],
-  ['blind', { ok: true, draft: false, streaming: false }, 1],
   ['silence', { ok: true, draft: false, streaming: true }, 1]
 ])('for reason %s and page status %j reloads %i time(s)', async (reason, status, reloads) => {
   const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';

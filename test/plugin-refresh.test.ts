@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const wake = vi.hoisted(() => vi.fn());
 vi.mock('../src/main/browser-wake.js', () => ({ wakeBrowserWork: wake }));
 import { initDurableStore, resetDurableForTests, readDurable, writeDurableNow } from '../src/main/durable.js';
-import { PLUGIN_REFRESH_FAILURE_LIMIT, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh, pendingPluginRefreshes, pluginRefreshPublications, publishPluginSurface, rearmPluginRefresh, resetPluginRefreshForTests, unpublishPluginSurface } from '../src/main/plugin-refresh.js';
+import { PLUGIN_REFRESH_FAILURE_LIMIT, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh, forcePluginRefresh, forcePluginRefreshes, pendingPluginRefreshes, pluginRefreshPublications, publishPluginSurface, rearmPluginRefresh, rediscoverPluginRefresh, resetPluginRefreshForTests, unpublishPluginSurface } from '../src/main/plugin-refresh.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 import { buildServer } from '../src/main/mcp/tools.js';
 import { defaultConfig } from '../src/main/config.js';
@@ -37,6 +37,17 @@ it('keeps Desktop independent and debounces shape changes across reconnects', as
   expect((await pendingPluginRefreshes()).map(row => row.surface)).toEqual(['desktop']);
   vi.advanceTimersByTime(20_000);
   expect((await pendingPluginRefreshes()).map(row => row.surface).sort()).toEqual(['core', 'desktop']);
+});
+it('accepts a first-party Desktop connector with more than sixteen tools', async () => {
+  const desktopTools: PluginToolSchema[] = Array.from({ length: 24 }, (_, i) => ({
+    name: `desktop_tool_${i}`, description: `Desktop tool ${i}`, inputSchema: { type: 'object', properties: {} }
+  }));
+  publishPluginSurface('desktop', 'Chat On Steroids Desktop', '1', '', desktopTools);
+  const request = (await pendingPluginRefreshes())[0]!;
+  const installed = desktopTools.map(tool => ({ ...tool, description: `Older ${tool.description}` }));
+  expect(request.surface).toBe('desktop');
+  expect(await claimPluginRefresh({ ...request, appId, connectorName: 'Chat On Steroids Desktop', tools: installed })).toBe(true);
+  expect(await completePluginRefresh({ ...request, appId, tools: desktopTools })).toBe(true);
 });
 it('wakes a settled publication restored after its deadline elapsed while disconnected', async () => {
   publish();
@@ -158,6 +169,95 @@ it('enrolls already-current tools without granting a refresh click, including af
   resetPluginRefreshForTests();
   publishPluginSurface('core', 'Chat On Steroids Core', 'a-new-app-version', 'Different runtime instructions', tools);
   expect(await pendingPluginRefreshes()).toEqual([]);
+});
+it('forces an already-current publication through one fresh claimed refresh and resolves only after completion', async () => {
+  publish();
+  const enrollment = (await pendingPluginRefreshes())[0]!;
+  expect(await claimPluginRefresh({ ...enrollment, appId, connectorName: 'Chat On Steroids Core', tools, alreadyCurrent: true })).toBe(true);
+  const forced = forcePluginRefreshes(5_000);
+  await Promise.resolve(); await Promise.resolve();
+  const request = (await pendingPluginRefreshes())[0]!;
+  expect(request).toMatchObject({ surface: 'core', appId, force: true });
+  expect(await claimPluginRefresh({ ...request, appId, connectorName: 'Chat On Steroids Core', tools, force: true })).toBe(true);
+  expect(await pendingPluginRefreshes()).toEqual([]);
+  expect(await completePluginRefresh({ ...request, appId, tools })).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(forced).resolves.toEqual(['core']);
+});
+it('can force only the Plugins connector without refreshing Core or Desktop', async () => {
+  publishPluginSurface('core', 'Chat On Steroids Core', '1', 'Instructions', tools);
+  publishPluginSurface('desktop', 'Chat On Steroids Desktop', '1', 'Instructions', tools);
+  publishPlugins(tools);
+  const forced = forcePluginRefresh('plugins', 5_000);
+  await Promise.resolve(); await Promise.resolve();
+  const pending = await pendingPluginRefreshes();
+  const request = pending.find(item => item.surface === 'plugins')!;
+  expect(request).toMatchObject({ surface: 'plugins', force: true });
+  expect(pending.filter(item => item.force).map(item => item.surface)).toEqual(['plugins']);
+  expect(await claimPluginRefresh({ ...request, appId, connectorName: 'Chat On Steroids Plugins', tools, force: true })).toBe(true);
+  expect(await completePluginRefresh({ ...request, appId, tools })).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(forced).resolves.toEqual(['plugins']);
+});
+it('keeps the proven Plugins App ID when a force refresh follows a legitimate tool-name change', async () => {
+  const installed = Array.from({ length: 66 }, (_, i) => ({ name: `old_plugin_${i}`, description: `Old plugin ${i}`, inputSchema: { type: 'object' as const, properties: {} } }));
+  publishPlugins(installed);
+  const enrollment = (await pendingPluginRefreshes())[0]!;
+  expect(await claimPluginRefresh({ ...enrollment, appId, connectorName: 'Chat On Steroids Plugins', tools: installed, alreadyCurrent: true })).toBe(true);
+
+  const changed = installed.map((tool, i) => i === 65 ? { ...tool, name: 'new_plugin_65', description: 'Replacement plugin' } : tool);
+  publishPlugins(changed);
+  const forced = forcePluginRefreshes(5_000);
+  await Promise.resolve(); await Promise.resolve();
+  const request = (await pendingPluginRefreshes()).find(item => item.surface === 'plugins')!;
+  expect(request).toMatchObject({ appId, force: true });
+  // Exact App ID ownership permits the provider's stale installed declaration to be
+  // refreshed even though its tool names no longer match the new local publication.
+  expect(await claimPluginRefresh({ ...request, appId, connectorName: 'Chat On Steroids Plugins', tools: installed, force: true })).toBe(true);
+  expect(await completePluginRefresh({ ...request, appId, tools: changed })).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(forced).resolves.toEqual(['plugins']);
+});
+it('uses durable force ownership even if the browser claim omits the echoed force flag', async () => {
+  publish();
+  const forced = forcePluginRefreshes(5_000);
+  await Promise.resolve(); await Promise.resolve();
+  const request = (await pendingPluginRefreshes())[0]!;
+  expect(request.force).toBe(true);
+  const { force: _force, ...withoutEcho } = request;
+  expect(await claimPluginRefresh({ ...withoutEcho, appId, connectorName: 'Chat On Steroids Core', tools })).toBe(true);
+  expect(await completePluginRefresh({ ...request, appId, tools })).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(forced).resolves.toEqual(['core']);
+});
+it('releases force ownership after a claimed refresh fails', async () => {
+  publish();
+  const enrollment = (await pendingPluginRefreshes())[0]!;
+  expect(await claimPluginRefresh({ ...enrollment, appId, connectorName: 'Chat On Steroids Core', tools, alreadyCurrent: true })).toBe(true);
+  const forced = forcePluginRefreshes(5_000);
+  await Promise.resolve(); await Promise.resolve();
+  const request = (await pendingPluginRefreshes())[0]!;
+  expect(await claimPluginRefresh({ ...request, appId, connectorName: 'Chat On Steroids Core', tools, force: true })).toBe(true);
+  expect(await failPluginRefresh({ id: request.id, error: 'Provider refresh failed' })).toBe(true);
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(forced).rejects.toThrow(/Provider refresh failed/);
+  expect((await readDurable('plugin-refresh') as any[])[0].force).toBe(false);
+});
+it('forgets a stale pre-claim App ID and accepts the uniquely rediscovered replacement', async () => {
+  publish();
+  const first = (await pendingPluginRefreshes())[0]!;
+  expect(await claimPluginRefresh({ ...first, appId, connectorName: 'Chat On Steroids Core', tools, alreadyCurrent: true })).toBe(true);
+  const changed = [{ ...tools[0]!, description: 'Changed declaration' }];
+  publish('2', changed);
+  const stale = (await pendingPluginRefreshes())[0]!;
+  expect(stale.appId).toBe(appId);
+  const replacement = 'asdk_app_recreated';
+  expect(await rediscoverPluginRefresh({ id: stale.id, appId })).toBe(true);
+  const rediscovered = (await pendingPluginRefreshes())[0]!;
+  expect(rediscovered.appId).toBeNull();
+  expect(await claimPluginRefresh({ ...rediscovered, appId: replacement, connectorName: 'Chat On Steroids Core', tools })).toBe(true);
+  expect(await completePluginRefresh({ ...rediscovered, appId: replacement, tools: changed })).toBe(true);
+  expect((await readDurable('plugin-refresh') as any[])[0].appId).toBe(replacement);
 });
 it('does not settle a changed contract as already current', async () => {
   publish(); const request = (await pendingPluginRefreshes())[0]!;

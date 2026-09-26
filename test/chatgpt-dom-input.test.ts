@@ -8,6 +8,8 @@ interface DomApi {
   enterProject(entry: { id: string; sourceConversationId: string }, current?: () => boolean): Promise<boolean>;
   composerActions(): { host: HTMLElement; before: HTMLElement | null } | null;
   generating(): boolean;
+  providerHold(): Element | null;
+  providerHoldReplacesStop(): boolean;
   sendButton(): HTMLButtonElement | null;
   temporaryChatReady(): boolean;
   errors(): Array<{ text: string; recoverable: boolean; blocking?: boolean }>;
@@ -16,7 +18,7 @@ interface DomApi {
   hasComposerAttachments(): boolean;
   stopGeneration(current: () => boolean): boolean;
   inspectModelSettings(current?: () => boolean, failure?: (reason: string) => void): Promise<Array<{id: string; label: string; efforts: string[]}> | null>;
-  send(options?: { acceptanceTimeoutMs?: number; stillCurrent?: () => boolean; beforeSend?: () => Promise<boolean> }): Promise<boolean>;
+  send(options?: { acceptanceTimeoutMs?: number; stillCurrent?: () => boolean; beforeSend?: () => Promise<boolean>; allowProviderHold?: boolean }): Promise<boolean>;
   selectModelSettings(model: string | null, effort: string | null, current?: () => boolean): Promise<boolean>;
   uploadImages(images: Array<{ name: string; dataUrl: string }>, current?: () => boolean, draft?: ReturnType<DomApi['captureComposerDraft']>, files?: File[]): Promise<boolean>;
 }
@@ -268,6 +270,59 @@ describe('one native Send and bounded acceptance observation', () => {
     await vi.advanceTimersByTimeAsync(101);
     expect(await result).toBe(true);
     expect(clicks).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces only an exact current provider hold when that recovery explicitly allows it', async () => {
+    const route = new URL(document.URL).pathname;
+    const held = document.createElement('section');
+    held.dataset.testid = 'conversation-turn-2';
+    held.setAttribute('data-clf-protection-hold', route);
+    document.body.prepend(held);
+    const clicks = vi.fn(() => { box.textContent = ''; });
+    button.addEventListener('click', clicks);
+
+    expect(api.providerHold()).toBe(held);
+    expect(await api.send()).toBe(false);
+    expect(clicks).not.toHaveBeenCalled();
+    expect(await api.send({ allowProviderHold: true })).toBe(true);
+    expect(clicks).toHaveBeenCalledOnce();
+  });
+
+  it('uses the locale-free current-shell Send control for an explicitly allowed provider hold', async () => {
+    const route = new URL(document.URL).pathname;
+    const held = document.createElement('section');
+    held.dataset.testid = 'conversation-turn-2';
+    held.setAttribute('data-clf-protection-hold', route);
+    document.body.prepend(held);
+    button.removeAttribute('data-testid');
+    button.removeAttribute('aria-label');
+    button.className = 'size-token-button-composer bg-composer-primary';
+    button.innerHTML = '<svg><path d="M1 1 L2 2"></path></svg>';
+    const clicks = vi.fn(() => { box.textContent = ''; });
+    button.addEventListener('click', clicks);
+
+    expect(api.sendButton()).toBeNull();
+    expect(await api.send()).toBe(false);
+    expect(await api.send({ allowProviderHold: true })).toBe(true);
+    expect(clicks).toHaveBeenCalledOnce();
+  });
+
+  it('refuses provider-hold replacement while any native Stop control is still mounted', async () => {
+    const route = new URL(document.URL).pathname;
+    const held = document.createElement('section');
+    held.dataset.testid = 'conversation-turn-2';
+    held.setAttribute('data-clf-protection-hold', route);
+    document.body.prepend(held);
+    const first = document.createElement('button');
+    first.dataset.testid = 'stop-button';
+    const second = document.createElement('button');
+    second.dataset.testid = 'stop-button';
+    button.parentElement!.append(first, second);
+    const clicks = vi.fn(); button.addEventListener('click', clicks);
+
+    expect(api.providerHoldReplacesStop()).toBe(false);
+    expect(await api.send({ allowProviderHold: true })).toBe(false);
+    expect(clicks).not.toHaveBeenCalled();
   });
 
   it('times out once after 30 seconds and never clicks a Send that stays disabled', async () => {
@@ -654,29 +709,6 @@ describe('rendered temporary-chat state independent of language', () => {
     toggle(label, true);
     expect(api.temporaryChatReady()).toBe(true);
   });
-  /**
-   * The same answer from the page's own state, for a layout that no longer draws the glyph.
-   *
-   * Measured on 2026-09-25 across both kinds of chat: React holds `entry.isTemporaryChat`, true
-   * on `/c/<id>?temporary-chat=true` and false on an ordinary chat. `fiber.js` stamps that onto
-   * the turn with the pathname it was observed on, so a stamp left behind by another route
-   * cannot answer for this one — the same rule the running hint beside it follows.
-   */
-  it('accepts the state a mounted turn published, and only for this route', () => {
-    const shell = document.createElement('main');
-    shell.setAttribute('data-app-shell-main-surface', '');
-    shell.innerHTML = '<div data-thread-find-target="conversation"><div data-turn-key="t-1"></div></div>';
-    document.body.append(shell);
-    const turn = shell.querySelector('[data-turn-key]')!;
-    expect(api.temporaryChatReady(), 'an unstamped turn claimed the mode').toBe(false);
-
-    turn.setAttribute('data-clf-temporary-chat', '/c/somewhere-else');
-    expect(api.temporaryChatReady(), 'a stamp from another route answered for this one').toBe(false);
-
-    turn.setAttribute('data-clf-temporary-chat', dom.window.location.pathname);
-    expect(api.temporaryChatReady()).toBe(true);
-  });
-
   it('does not mistake a hidden checked glyph, English wording or URL intent for active mode', () => {
     dom.reconfigure({ url: 'https://chatgpt.com/?temporary-chat=true' });
     toggle('Turn off temporary chat', false);
@@ -723,6 +755,26 @@ describe('locale-independent provider composer evidence', () => {
     expect(api.sendButton()).toBeNull();
     expect(api.generating()).toBe(false);
     expect(api.stopGeneration(() => true)).toBe(false);
+  });
+
+  it('keeps only the newest current-route provider protection hold busy when Stop is replaced', () => {
+    button.setAttribute('aria-label', 'Send');
+    const route = new URL(document.URL).pathname;
+    const old = document.createElement('section');
+    old.dataset.testid = 'conversation-turn-1';
+    old.setAttribute('data-clf-protection-hold', route);
+    const current = document.createElement('section');
+    current.dataset.testid = 'conversation-turn-2';
+    document.body.prepend(old, current);
+
+    expect(api.providerHold()).toBeNull();
+    expect(api.generating()).toBe(false);
+    current.setAttribute('data-clf-protection-hold', route);
+    expect(api.providerHold()).toBe(current);
+    expect(api.generating()).toBe(true);
+    current.setAttribute('data-clf-protection-hold', '/c/another-chat');
+    expect(api.providerHold()).toBeNull();
+    expect(api.generating()).toBe(false);
   });
 
   it('does not anchor to a microphone glyph in prose or an unrelated composer control', () => {

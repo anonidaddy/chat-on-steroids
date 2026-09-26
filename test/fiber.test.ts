@@ -281,8 +281,10 @@ interface TurnFixture {
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
   rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string; v5?: boolean }>;
+  native?: Array<{ fiber: Fiber; hidden?: boolean; inert?: boolean; ariaHidden?: boolean }>;
   images?: Array<{ assetId: string; clones?: number }>;
   staleStamp?: string;
+  staleProtection?: string;
   conversationProps?: Record<string, unknown>;
   rect?: { top: number; bottom: number; left: number; right: number } | 'throw';
 }
@@ -300,6 +302,7 @@ async function scan(
   messageStamps: Array<string | null>;
   thoughtStamps: Array<string | null>;
   imageStamps: Array<string | null>;
+  protectionStamps: Array<string | null>;
   repeatedStampMutations: number;
   turns: TurnEvidence[];
 }> {
@@ -316,6 +319,7 @@ async function scan(
     section.setAttribute('data-testid', 'conversation-turn-2');
     if (turn.id) section.setAttribute('data-turn-id', turn.id);
     if (turn.staleStamp !== undefined) section.setAttribute('data-clf-fiber-turn', turn.staleStamp);
+    if (turn.staleProtection !== undefined) section.setAttribute('data-clf-protection-hold', turn.staleProtection);
     if (turn.rect) section.getBoundingClientRect = () => {
       if (turn.rect === 'throw') throw new Error('unavailable geometry');
       return turn.rect as DOMRect;
@@ -345,6 +349,14 @@ async function scan(
       if (entry.staleThoughtStamp) row.setAttribute('data-clf-fiber-thought', entry.staleThoughtStamp);
       (row as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
       section.append(row);
+    }
+    for (const entry of turn.native ?? []) {
+      const node = document.createElement('div');
+      if (entry.hidden) node.hidden = true;
+      if (entry.inert) node.setAttribute('inert', '');
+      if (entry.ariaHidden) node.setAttribute('aria-hidden', 'true');
+      (node as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
+      section.append(node);
     }
     for (const entry of turn.images ?? []) {
       const add = () => {
@@ -393,7 +405,7 @@ async function scan(
   if (repeatStableScan) {
     const observer = new window.MutationObserver(() => {});
     observer.observe(document.body, { subtree: true, attributes: true,
-      attributeFilter: ['data-clf-fiber-turn', 'data-clf-fiber-message', 'data-clf-fiber-thought'] });
+      attributeFilter: ['data-clf-fiber-turn', 'data-clf-fiber-message', 'data-clf-fiber-thought', 'data-clf-protection-hold'] });
     window.dispatchEvent(new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce }, source: window }));
     repeatedStampMutations = observer.takeRecords().length;
     observer.disconnect();
@@ -408,6 +420,9 @@ async function scan(
   const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
     section.getAttribute('data-clf-fiber-turn')
   );
+  const protectionStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
+    section.getAttribute('data-clf-protection-hold')
+  );
   dom.window.close();
   return {
     rows: data.rows as Descriptor[],
@@ -418,6 +433,7 @@ async function scan(
     messageStamps,
     thoughtStamps,
     imageStamps,
+    protectionStamps,
     repeatedStampMutations,
     turns: (data.turns ?? []) as TurnEvidence[]
   };
@@ -1304,6 +1320,32 @@ describe('the calls a turn says it made', () => {
     const { turns } = await scan([], [{ id: 'turn-quiet', messages: [chatter] }]);
 
     expect(turns).toEqual([]);
+  });
+
+  it('stamps only the newest visible provider protection hold without exporting its policy value', async () => {
+    const protection = () => chain({ protectionType: 'cyber' }, 4);
+    const result = await scan([], [
+      { id: 'turn-old-hold', messages: [], native: [{ fiber: protection() }] },
+      { id: 'turn-live-hold', messages: [], native: [{ fiber: protection() }] }
+    ], true);
+
+    expect(result.turns).toEqual([]);
+    expect(result.protectionStamps).toEqual([null, `/c/${THREAD}`]);
+    expect(JSON.stringify(result)).not.toContain('cyber');
+    expect(result.repeatedStampMutations).toBe(0);
+  });
+
+  it.each(['hidden', 'inert', 'ariaHidden'] as const)('ignores a %s protection component', async mode => {
+    const result = await scan([], [{
+      id: `turn-${mode}-hold`, messages: [],
+      native: [{ fiber: chain({ protectionType: 'cyber' }, 4), [mode]: true }]
+    }]);
+    expect(result.protectionStamps).toEqual([null]);
+  });
+
+  it('removes a stale protection hold stamp when the native component is gone', async () => {
+    const result = await scan([], [{ id: 'turn-cleared-hold', messages: [], staleProtection: `/c/${THREAD}` }]);
+    expect(result.protectionStamps).toEqual([null]);
   });
 
   it('reports a request id ChatGPT has published before the api_tool message exists', async () => {

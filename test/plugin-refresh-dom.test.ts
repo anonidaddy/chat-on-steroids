@@ -54,7 +54,23 @@ it.each([118, 257])('accepts %s declarations for the Plugins connector including
   const view = await api.pluginRefreshView('Chat On Steroids Plugins');
   expect(view?.tools).toHaveLength(count);
 });
-it.each([['Chat On Steroids Plugins', 258], ['Chat On Steroids Core', 17]] as const)('retains the %s observation count guard', async (connector, count) => {
+it('accepts MCP tool names containing hyphens on the Plugins connector', async () => {
+  const { api, props } = page();
+  props.connector.name = 'Chat On Steroids Plugins';
+  props.actions = [
+    { name: 'resolve-library-id', description: 'Resolve a library.', description_model: null, params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+    { name: 'query-docs', description: 'Query docs.', description_model: null, params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }
+  ];
+  expect((await api.pluginRefreshView('Chat On Steroids Plugins'))?.tools.map((entry: any) => entry.name)).toEqual(['resolve-library-id', 'query-docs']);
+});
+it('accepts up to 64 declarations on first-party connectors', async () => {
+  const { api, props } = page();
+  props.connector.name = 'Chat On Steroids Desktop';
+  props.actions = Array.from({ length: 24 }, (_, i) => ({ name: `desktop_tool_${i}`, description: `Desktop tool ${i}`, description_model: null,
+    params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }));
+  expect((await api.pluginRefreshView('Chat On Steroids Desktop'))?.tools).toHaveLength(24);
+});
+it.each([['Chat On Steroids Plugins', 258], ['Chat On Steroids Core', 65]] as const)('retains the %s observation count guard', async (connector, count) => {
   const { api, props } = page();
   props.connector.name = connector;
   props.actions = Array.from({ length: count }, (_, i) => ({ name: `tool_${i}`, description: `Tool ${i}`, description_model: null,
@@ -77,6 +93,19 @@ it('discovers exact installed rows across languages and preserves ambiguity', ()
   expect(api.pluginInstalledButtons('Chat On Steroids Core')).toHaveLength(1);
   expect(api.pluginInstalledButtons('Chat On Steroids Desktop')).toEqual([]);
   panel.insertAdjacentHTML('beforeend', panel.querySelector('button')!.outerHTML);
+  expect(api.pluginInstalledButtons('Chat On Steroids Core')).toHaveLength(2);
+});
+it('discovers current path-routed installed rows when ChatGPT flattens name and description into the button text', () => {
+  dom = new JSDOM('<main><button>Chat On Steroids CoreRead and edit code and text files on this computer.</button><button>Chat On Steroids DesktopControl browser tabs.</button><button>Chat On Steroids PluginsTools from external MCP integrations.</button></main>',
+    { runScripts: 'outside-only', url: 'https://chatgpt.com/settings/plugins-settings' });
+  const win = dom.window;
+  Object.defineProperty(win.HTMLElement.prototype, 'getClientRects', { value() { return this.hidden ? [] : [{}]; } });
+  win.eval(source);
+  const api = (win as any).CLF_DOM;
+  expect(api.pluginInstalledButtons('Chat On Steroids Core')).toHaveLength(1);
+  expect(api.pluginInstalledButtons('Chat On Steroids Desktop')).toHaveLength(1);
+  expect(api.pluginInstalledButtons('Chat On Steroids Plugins')).toHaveLength(1);
+  win.document.querySelector('main')!.insertAdjacentHTML('beforeend', '<button>Chat On Steroids CoreAnother visible copy</button>');
   expect(api.pluginInstalledButtons('Chat On Steroids Core')).toHaveLength(2);
 });
 

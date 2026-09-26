@@ -429,6 +429,35 @@ async function mountChat(
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+it('locks the visible plugin refresh action, replaces the composer, then restores it with a completion toast', async () => {
+  let finish!: () => void;
+  const refresh = vi.fn(() => new Promise(resolve => { finish = () => resolve({ ok: true, data: ['core', 'desktop', 'plugins'] }); }));
+  const { window } = await mountChat({}, [], { pluginsRefreshAll: refresh });
+  const button = window.document.getElementById('refreshPlugins') as HTMLButtonElement;
+  const composer = window.document.getElementById('composer') as HTMLElement;
+  const busy = window.document.getElementById('pluginRefreshBusy') as HTMLElement;
+  const card = window.document.querySelector('.card.is-session') as HTMLElement;
+
+  button.click(); await settle();
+  expect(refresh).toHaveBeenCalledTimes(1);
+  expect(button.disabled).toBe(true);
+  expect(button.textContent).toContain('Refreshing plugins');
+  expect(button.getAttribute('aria-busy')).toBe('true');
+  expect(busy.hidden).toBe(false);
+  expect(card.classList.contains('is-plugin-refreshing')).toBe(true);
+  expect(composer.closest('.is-plugin-refreshing')).toBe(card);
+
+  button.click();
+  expect(refresh).toHaveBeenCalledTimes(1);
+  finish(); await settle(); await settle();
+  expect(button.disabled).toBe(false);
+  expect(button.textContent).toContain('Refresh plugins');
+  expect(button.getAttribute('aria-busy')).toBe('false');
+  expect(busy.hidden).toBe(true);
+  expect(card.classList.contains('is-plugin-refreshing')).toBe(false);
+  expect(window.document.querySelector('.toast')?.textContent).toBe('Refreshed');
+});
+
 const projectSidebarFixture = () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Collapsed project', path: 'C:\\repo', createdAt: 1 };
   const session = { id: 'project-session', title: 'Project task', conversationId: 'chat-project', chatIds: ['chat-project'],
@@ -788,6 +817,24 @@ it('shows startup bind errors in the existing Setup status and clears them after
   expect(status.textContent).toContain('Browser bridge could not start: port 8767: EADDRINUSE');
   mounted.push({ ...mounted.state, bridge: { running: true, port: 8768, paired: false, present: false, error: null } });
   expect(status.textContent).toContain('8768'); expect(status.textContent).not.toContain('EADDRINUSE');
+});
+
+it('covers the chat surface until the extension is connected and opens Setup from the gate', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  const card = doc.querySelector<HTMLElement>('[data-panel="chat"] .card.is-session')!;
+  const gate = doc.getElementById('extensionConnectionGate')!;
+
+  expect(card.classList.contains('is-extension-waiting')).toBe(true);
+  expect(gate.hidden).toBe(false);
+  expect(gate.textContent).toContain('waiting for extension connection');
+
+  (doc.getElementById('extensionSetup') as HTMLButtonElement).click();
+  expect(doc.querySelector('[data-panel="setup"]')!.classList.contains('is-active')).toBe(true);
+
+  mounted.push({ ...mounted.state, bridge: { ...mounted.state.bridge, paired: true, present: true, lastSeenAt: Date.now(), extensionVersion: '2.0.2' } });
+  expect(card.classList.contains('is-extension-waiting')).toBe(false);
+  expect(gate.hidden).toBe(true);
 });
 
 it('restores a rejected focused port and prevents an unrelated queued save from retrying it', async () => {
