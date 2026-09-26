@@ -79,6 +79,7 @@
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents, div:has(> [data-testid="cot-v5-tool-icon-pile"])';
   const GENERATED_IMAGE = '[class~="group/imagegen-image"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
+  const PROTECTION_HOLD = 'data-clf-protection-hold';
   const MAX_RENDERED_HTML = 120_000;
   // A 15k–20k-token compaction answer is routinely 60k–90k characters. Capping public
   // assistant prose at 32k here made the canonical session transcript lose the back half
@@ -138,6 +139,7 @@
   const PATH_HEAD = /^\s*\{\s*"path"\s*:\s*"([^"\\]{1,200})"/;
   /** A tool name we are willing to put on a row. */
   const NAME = /^[a-z0-9_.-]{1,64}$/i;
+  const FIRST_PARTY_MAX_TOOLS = 64;
 
   // Captured before the page can swap them. If the page has already replaced one of these
   // at load time there is nothing to be done about it, but it cannot do so afterwards.
@@ -214,6 +216,35 @@
       if (key.charCodeAt(0) === 95 && key.indexOf('__reactFiber$') === 0) return committedPath(node[key]);
     }
     return null;
+  }
+
+  /**
+   * Whether ChatGPT's current response is parked in one of its provider-side protection holds.
+   *
+   * The rendered notice is localized and has already changed presentation shape. The native
+   * component behind it exposes a short `protectionType` prop instead. Export none of that value:
+   * this helper needs only one bit of lifecycle evidence, and copying the raw policy name would
+   * widen the MAIN -> isolated bridge for no recorder purpose. Scan only the newest turn and a
+   * bounded number of its mounted nodes; hidden/inert remnants are not current UI state.
+   */
+  function protectionHoldOf(sections) {
+    let remaining = 160;
+    for (const section of sections || []) {
+      let nodes;
+      try { nodes = [section, ...section.querySelectorAll('*')]; } catch { continue; }
+      for (const node of nodes) {
+        if (--remaining < 0) return false;
+        if (node.closest?.(`${OWN_SURFACES},[hidden],[inert],[aria-hidden="true"]`)) continue;
+        let fiber = fiberOf(node);
+        for (let up = 0; fiber && up < 32; up++, fiber = fiber.return) {
+          const props = fiber.memoizedProps;
+          if (!props || !own.call(props, 'protectionType')) continue;
+          const value = props.protectionType;
+          if (typeof value === 'string' && /^[a-z][a-z0-9_-]{0,63}$/i.test(value)) return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**
@@ -1772,6 +1803,7 @@
     const desiredMessageStamps = new Map();
     const desiredThoughtStamps = new Map();
     const desiredImageStamps = new Map();
+    const desiredProtectionHolds = new Set();
     const groups = [];
     for (let at = 0; at < sections.length; at++) {
       const section = sections[at];
@@ -1838,6 +1870,8 @@
         const nativeActivities = shell ? shellPublicActivity(shell, metadata, renderedMessages, turnBudget, section, exactAnchors) : nativeActivitiesOf(group.sections, messages, exactThoughtRows);
         responseBudget.remaining -= before - turnBudget.remaining;
         const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes);
+        const protectionHold = at === groups.length - 1 && protectionHoldOf(group.sections);
+        if (protectionHold) for (const stamped of group.sections) if (stamped) desiredProtectionHolds.add(stamped);
         const activities = nativeActivities.events;
         const endMessageId = turnEndMessageId(messages);
         // The shell supplies the completed final item's own exact message id,
@@ -1888,24 +1922,6 @@
           const running = shell.entry.turn.status === 'in_progress' ? location.pathname : null;
           if (running && section.getAttribute('data-clf-shell-running') !== running) section.setAttribute('data-clf-shell-running', running);
           else if (!running) section.removeAttribute('data-clf-shell-running');
-          /*
-           * Whether this is a temporary chat, said by the page's own state rather than read off
-           * an icon.
-           *
-           * `temporaryChatReady()` proves the mode from the checked glyph in the toolbar, which
-           * is the only evidence a document has while nothing is mounted. Once a turn exists,
-           * React holds the answer directly — measured on 2026-09-25 across both kinds of chat:
-           * `entry.isTemporaryChat` is true on `/c/<id>?temporary-chat=true` and false on an
-           * ordinary chat, at every depth it appears. A layout that stops drawing that glyph
-           * therefore stops proving the mode, while this keeps proving it.
-           *
-           * Stamped with the pathname for the same reason the running hint is: a stamp left on a
-           * section from another route must not answer for this one. Absent state leaves no
-           * stamp at all, so the glyph remains the proof where React says nothing.
-           */
-          const temporary = shell.entry.isTemporaryChat === true ? location.pathname : null;
-          if (temporary && section.getAttribute('data-clf-temporary-chat') !== temporary) section.setAttribute('data-clf-temporary-chat', temporary);
-          else if (!temporary) section.removeAttribute('data-clf-temporary-chat');
         }
         if (!conversation.conflict) for (const [node, id] of exactAnchors) {
           desiredMessageStamps.set(node, `${scanToken}:${index}:${encodeURIComponent(id)}`);
@@ -1953,9 +1969,13 @@
             if (currentImage !== null) node.removeAttribute('data-clf-fiber-image');
           } else if (currentImage !== wantedImage) node.setAttribute('data-clf-fiber-image', wantedImage);
         }
-        if (!desiredTurnStamps.has(section)) {
-          section.removeAttribute('data-clf-shell-running');
-          section.removeAttribute('data-clf-temporary-chat');
+        if (!desiredTurnStamps.has(section)) section.removeAttribute('data-clf-shell-running');
+        const wantedProtection = desiredProtectionHolds.has(section) ? location.pathname : null;
+        const currentProtection = section.getAttribute(PROTECTION_HOLD);
+        if (wantedProtection === null) {
+          if (currentProtection !== null) section.removeAttribute(PROTECTION_HOLD);
+        } else if (currentProtection !== wantedProtection) {
+          section.setAttribute(PROTECTION_HOLD, wantedProtection);
         }
         for (const stamped of [section, ...section.querySelectorAll('[data-content-search-unit-key]')]) {
           const wanted = desiredTurnStamps.get(stamped);
@@ -1983,7 +2003,6 @@
   function scan(nonce) {
     // The existing scan also refreshes mounted-picker evidence; no new poll timer.
     try { pickerSnapshot(); } catch { /* An unknown picker cannot affect recording. */ }
-    try { temporaryModeSnapshot(); } catch { /* Unknown mode leaves no stamp, never a false one. */ }
     // The request nonce already uniquely names this scan across the two worlds. Reuse it as
     // the ephemeral frame token rather than minting a second random value: every DOM stamp
     // can then prove both which descriptor index it names and which exact scan produced it.
@@ -2031,33 +2050,6 @@
     post({ source: REPLY, nonce, scanToken, v: VERSION, scanOk, rows, turns }, location.origin);
   }
 
-  /**
-   * Whether this document is a temporary chat, from React's own state rather than an icon.
-   *
-   * The newer shell draws the header toggle with inline paths instead of the `#chat-temp-checked`
-   * sprite `temporaryChatReady()` looked for, so an empty temporary chat stopped proving its mode
-   * at all (measured 2026-09-26, English and German). The toggle's owner carries
-   * `isTemporaryChat` a few Fibers up — true on `/?temporary-chat=true`, false after switching it
-   * off — which is the same state the mounted-turn stamp reads. Only a single consistent answer
-   * from visible header buttons stamps the document, with the pathname it was made on.
-   */
-  function temporaryModeSnapshot() {
-    const answers = new Set();
-    const buttons = [...document.querySelectorAll('button')].filter(button => button.getClientRects().length > 0 &&
-      !button.closest(`${OWN_SURFACES},form,[data-turn-key],[data-testid^="conversation-turn"],nav,aside`)).slice(0, 40);
-    for (const button of buttons) {
-      let at = fiberOf(button);
-      for (let up = 0; at && up < 12; up++, at = at.return) {
-        const props = at.memoizedProps;
-        if (props && typeof props === 'object' && typeof props.isTemporaryChat === 'boolean') { answers.add(props.isTemporaryChat); break; }
-      }
-    }
-    const root = document.documentElement;
-    if (answers.size === 1 && answers.has(true)) {
-      if (root.getAttribute('data-clf-temporary-page') !== location.pathname) root.setAttribute('data-clf-temporary-page', location.pathname);
-    } else root.removeAttribute('data-clf-temporary-page');
-  }
-
   /** Picker data is account-evaluated state, never a scraped English announcement.
    * Copy only selection metadata; no conversation, account object or callbacks cross worlds. */
   function pickerSnapshot() {
@@ -2103,24 +2095,17 @@
     const machine = node.getAttribute('data-selected-reasoning-effort');
     // The reported alternate trigger exposes a locale-independent selected effort.
     // Unknown explicit values invalidate proof rather than falling back to its caption.
-    const captionEffort = ({ instant: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high',
-      'extra high': 'xhigh', max: 'max', ultra: 'ultra', pro: 'pro' })[String(node.textContent || '').trim().toLowerCase()];
-    let model = null, lane = null;
+    const effort = machine !== null ? (['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(machine) ? machine : null)
+      : ({ instant: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high',
+        'extra high': 'xhigh', max: 'max', ultra: 'ultra', pro: 'pro' })[String(node.textContent || '').trim().toLowerCase()];
+    if (!effort) return null;
+    let model = null;
     for (let fiber = fiberOf(node), up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
-      // The shell picker's selected lane carries the visible effort name: the machine
-      // attribute reports its transport value (medium/max) for Pro/Extra High lanes.
-      const sel = fiber.memoizedProps?.selectedPowerSelection ?? fiber.memoizedProps?.selectedLabelCandidate;
-      if (lane === null && sel) lane = { model: sel.model,
-        effort: ({ instant:'none', minimal:'minimal', low:'low', medium:'medium', high:'high',
-          'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[String(sel.labels?.effort ?? sel.sliderLabel ?? '').trim().toLowerCase()] ?? null };
       const current = fiber.memoizedProps?.currentModelId;
       if (current === undefined) continue;
       if (typeof current !== 'string' || !/^[a-zA-Z0-9._-]{1,80}$/.test(current) || (model && model !== current)) return null;
       model = current;
     }
-    const effort = (lane && lane.model === model && lane.effort) ||
-      (machine !== null ? (['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(machine) ? machine : null) : captionEffort);
-    if (!effort) return null;
     return model ? { id: model, effort } : null;
   }
   function readPickerSnapshot(node) {
@@ -2176,23 +2161,19 @@
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
       const group = value => typeof value === 'string' && /^[\p{L}\p{N}._ -]{1,80}$/u.test(value) && value.trim() === value ? value : null;
       const label = value => typeof value === 'string' && value.trim() && value.length <= 80 ? value.trim() : null;
-      const effort = value => ({ none:'none', instant:'none', minimal:'minimal', min:'low', low:'low', standard:'medium', medium:'medium', extended:'high', high:'high', xhigh:'xhigh', 'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[value] || null;
-      // The machine reasoningEffort is a lane's transport setting, not its identity: the
-      // Pro and Extra High lanes still report medium/max. The lane's visible label is what
-      // the picker offers, matching readPickerSnapshot's modelLane/thinkingEffort mapping.
-      const laneEffort = c => effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ?? effort(c?.reasoningEffort);
+      const effort = value => ({ none:'none', instant:'none', minimal:'minimal', min:'low', low:'low', standard:'medium', medium:'medium', extended:'high', high:'high', xhigh:'xhigh', max:'max', ultra:'ultra', pro:'pro' })[value] || null;
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
       const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
       const choices = p.powerSelections.map(c => ({ bucket: c?.powerSettingIndex, id: id(c?.model),
-        label: label(c?.modelLabel), familyId: id(c?.model), familyLabel: label(c?.modelLabel), effort: laneEffort(c),
+        label: label(c?.modelLabel), familyId: id(c?.model), familyLabel: label(c?.modelLabel), effort: effort(c?.reasoningEffort),
         available: p.modelSelectionDisabled !== true && c?.disabled !== true &&
           (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }));
       if (!version || !versions.length || versions.some(v => !v.id || !v.label) || !choices.length ||
           choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length || !versions.some(v => v.id === version)) return null;
-      const matches = choices.filter(c => c.id === id(selected.model) && c.effort === laneEffort(selected));
+      const matches = choices.filter(c => c.id === id(selected.model) && c.effort === effort(selected.reasoningEffort));
       if (matches.length !== 1 || (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)) return null;
       return { version, currentBucket: matches[0].bucket, versions, choices };
     }
@@ -2222,21 +2203,29 @@
     return result;
   }
 
+  function pluginSettingsAppId() {
+    const legacy = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
+    const current = /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname);
+    return legacy?.[1] || current?.[1] || null;
+  }
+
   function pluginSnapshot() {
-    const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
-    if (!route) return null;
+    const appId = pluginSettingsAppId();
+    if (!appId) return null;
+    const legacyRoute = /^#settings\/Plugins\/plugin_asdk_app_[a-zA-Z0-9_-]+$/.test(location.hash);
     const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel =>
       panel.getAttribute('aria-labelledby')?.endsWith('-trigger-Plugins') && !panel.hidden);
-    if (panels.length !== 1) return null;
-    const buttons = [...panels[0].querySelectorAll('button')].slice(0, 100);
-    let result = null, control = null, observedActions = null, observedCard = null;
+    const scope = panels.length === 1 ? panels[0] : document;
+    const buttons = [...scope.querySelectorAll('button')].filter(button => button.getClientRects().length > 0).slice(0, 160);
+    let result = null, control = null, observedActions = null, observedConnector = null, observedCard = null;
     for (const button of buttons) {
       let fiber = fiberOf(button);
+      let nativeRefresh = false, exactConnector = false;
       for (let up = 0; fiber && up < 24; up++, fiber = fiber.return) {
         const props = fiber.memoizedProps;
         if (!props) continue;
-        if (props.reportEntity?.entityType === 'connector' && props.reportEntity.id === route[1] &&
-            Array.isArray(props.details) && props.details.some(detail => detail.value === route[1]) &&
+        if (props.reportEntity?.entityType === 'connector' && props.reportEntity.id === appId &&
+            Array.isArray(props.details) && props.details.some(detail => detail.value === appId) &&
             button.getClientRects().length > 0) {
           if (observedCard && observedCard !== props) return null;
           observedCard = props;
@@ -2245,24 +2234,34 @@
             control = button;
           }
         }
-        if (props.connector?.id !== route[1] || !Array.isArray(props.actions) || props.isLoadingActions === true) continue;
-        if (props.actions === observedActions) continue;
+        if (props.children?.props?.id === 'browserPluginSettings.refreshActions' || props.label?.props?.id === 'browserPluginSettings.refreshActions') nativeRefresh = true;
+        if (props.connector?.id !== appId) continue;
+        exactConnector = true;
+        const actions = Array.isArray(props.connector.actions) ? props.connector.actions : Array.isArray(props.actions) ? props.actions : null;
+        if (!actions || props.isLoadingActions === true) continue;
+        if (observedConnector && observedConnector !== props.connector) return null;
+        observedConnector = props.connector;
+        if (actions === observedActions) continue;
         if (observedActions) return null;
-        observedActions = props.actions;
+        observedActions = actions;
         const externalPlugins = props.connector.name === 'Chat On Steroids Plugins';
-        if ((!props.actions.length && !externalPlugins) || props.actions.length > (externalPlugins ? 257 : 16) || typeof props.connector.name !== 'string') return null;
+        if ((!actions.length && !externalPlugins) || actions.length > (externalPlugins ? 257 : FIRST_PARTY_MAX_TOOLS) || typeof props.connector.name !== 'string') return null;
         const budget = { bytes: 280000, nodes: 20000 };
-        const tools = props.actions.map(action => ({ name: action.name, description: copySchema(action.description_model ?? action.description, budget), inputSchema: copySchema(action.params, budget) }));
+        const tools = actions.map(action => ({ name: action.name, description: copySchema(action.description_model || action.description, budget), inputSchema: copySchema(action.params, budget) }));
         if (tools.some(tool => !NAME.test(tool.name) || typeof tool.description !== 'string' || !tool.inputSchema || tool.inputSchema.type !== 'object') ||
             new Set(tools.map(tool => tool.name)).size !== tools.length) return null;
-        result = { appId: route[1], connectorName: props.connector.name.slice(0, 100),
+        result = { appId, connectorName: props.connector.name.slice(0, 100),
           versionId: str(props.connector.app_metadata?.version_id), tools };
       }
+      if (nativeRefresh && exactConnector) {
+        if (control && control !== button) return null;
+        control = button;
+      }
     }
-    if (!result || !observedCard) return null;
+    if (!result || (legacyRoute && !observedCard)) return null;
     // Stamp only the native button wired to this connector's header action. Never
     // invoke page callbacks; the isolated world still owns the durable claim and click.
-    if (control && control.getAttribute('data-clf-plugin-refresh') !== route[1]) control.setAttribute('data-clf-plugin-refresh', route[1]);
+    if (control && control.getAttribute('data-clf-plugin-refresh') !== appId) control.setAttribute('data-clf-plugin-refresh', appId);
     return { ...result, refreshAvailable: !!control };
   }
 

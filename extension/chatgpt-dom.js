@@ -64,27 +64,14 @@ var CLF_DOM = (() => {
 
   // Wire framing matches shared/user-prompt.ts; neither reader changes provider text.
   const promptContinuation = value => /^\[\[CLF-(?:HANDOFF|RESUME):[A-Za-z0-9_-]{16,64}\]\]\n\n/.exec(value)?.[0] ?? '';
-  // The composer treats what it is given as Markdown source and escapes it on readback: a
-  // backslash before ASCII punctuation, and one before a newline for a hard line break. The
-  // frame is punctuation and newlines almost entirely, so an escaped readback matches none of
-  // it — and the declared length stops matching too, because escaping adds characters. Read
-  // exactly first, as everywhere else; only a frame that cannot be read as sent is read as one
-  // the page escaped. Keep in sync with asTyped() in shared/user-prompt.ts.
-  const promptAsTyped = value => value.replace(/\\\n/g, '\n').replace(/\\([!-/:-@[-`{-~])/g, '$1');
-  function readPromptFrame(value) {
+  function userPromptText(value) {
+    value = value.replace(/\r\n?/g, '\n');
     const identity = promptContinuation(value);
     const header = /^\[\[COS_CONTEXT:(\d{1,6})\]\]\n/.exec(value.slice(identity.length));
     if (!header) return null;
     const end = identity.length + header[0].length + Number(header[1]);
     const boundary = '\n[[/COS_CONTEXT]]\n\n';
     return value.startsWith(boundary, end) ? identity + value.slice(end + boundary.length) : null;
-  }
-  function userPromptText(value) {
-    value = value.replace(/\r\n?/g, '\n');
-    const exact = readPromptFrame(value);
-    if (exact !== null) return exact;
-    const typed = promptAsTyped(value);
-    return typed === value ? null : readPromptFrame(typed);
   }
   function presentUserPrompts(readUserText) {
     return safe(() => {
@@ -301,11 +288,9 @@ var CLF_DOM = (() => {
     }, '0|0|');
   }
 
-  // The newer shell's wording, measured live on 2026-09-26 after a reload mid-stream: "A network error
-  // occurred. Please check your connection and try again." and "Resume stream unavailable".
   function transportFailure(value) {
     const line = String(value || '').replace(/\s+/g, ' ').trim();
-    return /^(?:message delivery timed out(?:\. please try again\.?)?|connection interrupted\.? waiting for the complete answer\.?|chatgpt stream recovery polling timed out\.?|unknown error occurred\.?|there was an error generating (?:a|the) response\.?|error in message stream\.?|network error\.?|a network error occurred\.?(?: please check your connection and try again\.?)?|resume stream unavailable\.?|something went wrong\.?|something went wrong while generating the response(?:\. if this issue persists please contact us through our help center at help\.openai\.com\.?)?\.?)(?: retry)?$/i.test(line);
+    return /^(?:message delivery timed out(?:\. please try again\.?)?|connection interrupted\.? waiting for the complete answer\.?|unknown error occurred\.?|there was an error generating (?:a|the) response\.?|error in message stream\.?|network error\.?|something went wrong\.?|something went wrong while generating the response(?:\. if this issue persists please contact us through our help center at help\.openai\.com\.?)?\.?)(?: retry)?$/i.test(line);
   }
 
   /**
@@ -728,10 +713,25 @@ var CLF_DOM = (() => {
       renderedComposerNode(button) && (!form || button.closest('form') === form));
   }
 
+  /** The newest native response whose mounted Fiber currently exposes a provider hold. */
+  function providerHold() {
+    return safe(() => {
+      const latestTurn = [...document.querySelectorAll(TURN)].filter(node =>
+        !node.closest(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`)).at(-1);
+      return latestTurn?.getAttribute('data-clf-protection-hold') === location.pathname ? latestTurn : null;
+    }, null);
+  }
+
   /** Stop is a busy hint only; the exact provider terminal still owns turn completion. */
   function generating() {
     return safe(() => {
       if (stopControls().length > 0) return true;
+      // ChatGPT can park a live request in a provider-side protection/deliberation hold while
+      // temporarily replacing the ordinary Stop control. MAIN-world Fiber stamps only the
+      // newest native response when its mounted component exposes that state, and exports no
+      // policy value. Treat the exact current-route stamp as the same kind of busy hint as Stop;
+      // final end_turn evidence still owns completion.
+      if (providerHold()) return true;
       // Historical interrupted exchanges can retain in_progress forever. Only the
       // latest native response can describe this composer's current generation.
       const latest = [...document.querySelectorAll(SHELL_TURN)].filter(node =>
@@ -807,6 +807,11 @@ var CLF_DOM = (() => {
     return labelled.length > 0 ? labelled : localeFreeStopControls();
   }
 
+  /** A provider hold may replace generation only after the native composer proves Stop is absent. */
+  function providerHoldReplacesStop() {
+    return !!providerHold() && stopControls().length === 0;
+  }
+
   /**
    * Send, found without a label, for the same composer and the same reason as the square above.
    *
@@ -826,14 +831,14 @@ var CLF_DOM = (() => {
    * regardless). Both are excluded explicitly all the same, and one candidate is still required,
    * so an unexpected third control refuses rather than being clicked.
    */
-  function localeFreeSendControls() {
+  function localeFreeSendControls(allowProviderHold = false) {
     const box = composer();
     const form = box?.closest('form');
     if (!form) return [];
     // Read the editor here rather than reusing the submitter's own `draftText`, which is a local
     // closure over its captured box. Only "the composer holds something" is needed, not equality.
     const drafted = (typeof box.innerText === 'string' ? box.innerText : box.textContent || '').trim();
-    if (drafted === '' || generating()) return [];
+    if (drafted === '' || (generating() && !(allowProviderHold && providerHoldReplacesStop()))) return [];
     return [...form.querySelectorAll('button[class*="size-token-button-composer"][class*="bg-composer-primary"]')]
       .filter(button => {
         if (!renderedComposerNode(button) || button.closest('form') !== form) return false;
@@ -846,9 +851,9 @@ var CLF_DOM = (() => {
       });
   }
 
-  function sendControls() {
+  function sendControls(allowProviderHold = false) {
     const labelled = nativeComposerControls(SEND);
-    return labelled.length > 0 ? labelled : localeFreeSendControls();
+    return labelled.length > 0 ? labelled : localeFreeSendControls(allowProviderHold);
   }
 
   function stopButton() {
@@ -871,9 +876,9 @@ var CLF_DOM = (() => {
   }
 
   /** The page-owned Send control, exposed so content.js can witness an actual submission. */
-  function sendButton() {
+  function sendButton(allowProviderHold = false) {
     return safe(() => {
-      const buttons = sendControls();
+      const buttons = sendControls(allowProviderHold);
       return buttons.length === 1 ? buttons[0] : null;
     }, null);
   }
@@ -1588,30 +1593,6 @@ var CLF_DOM = (() => {
   }
 
   /**
-   * ChatGPT's own "this conversation could not be loaded" surface, as its retry button, or null.
-   *
-   * Measured 2026-09-26 on the new shell after a tab reload landed mid-turn: the main area held
-   * one centred message and one "Retry" button, with no composer and no turn. Nothing about it
-   * is identified — no test id, role or stable class — so the recognition is structural and
-   * locale-free: a /c/ route whose main area has no composer, no turn, no editable host, little
-   * text and exactly one rendered button. The page stayed that way indefinitely while the turn
-   * kept running server-side, so every later observation of that chat was blind.
-   */
-  function conversationLoadFailure() {
-    return safe(() => {
-      if (!conversationId() || composer() || document.querySelector(`${TURN},[data-turn-key]`)) return null;
-      const area = document.querySelector('[data-app-shell-focus-area="main"]') || document.querySelector('main');
-      if (!area || area.querySelector('[contenteditable="true"],textarea,[role="textbox"],form')) return null;
-      const text = (area.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!text || text.length > 300) return null;
-      const buttons = [...area.querySelectorAll('button')].filter(button =>
-        !button.closest(`${OWN_SURFACES},[hidden],[inert],[aria-hidden="true"]`) && button.getClientRects().length > 0);
-      if (buttons.length !== 1 || buttons[0].disabled || buttons[0].getAttribute('aria-disabled') === 'true') return null;
-      return buttons[0];
-    }, null);
-  }
-
-  /**
    * Whether ChatGPT's editing host is presently safe to receive a new user message.
    *
    * This deliberately says nothing about whether *our* recorder still considers the previous
@@ -2109,10 +2090,13 @@ var CLF_DOM = (() => {
     }, false);
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null } = {}) {
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, allowProviderHold = false } = {}) {
     try {
       const box = composer();
-      if (!box || !box.isConnected || !stillCurrent() || generating() || stopButton()) return false;
+      const providerReplacement = () => allowProviderHold && providerHoldReplacesStop();
+      const busy = () => generating() && !providerReplacement();
+      const currentSendButton = () => sendButton(providerReplacement());
+      if (!box || !box.isConnected || !stillCurrent() || busy() || stopButton()) return false;
       if (box.getAttribute('aria-disabled') === 'true' || box.getAttribute('contenteditable') === 'false') return false;
       // Rich editors use adjacent paragraphs for newlines; textContent concatenates
       // their words. Preserve those boundaries when matching the rendered user message.
@@ -2190,9 +2174,9 @@ var CLF_DOM = (() => {
           // readiness through this same bounded operation; neither a guessed Enter nor
           // an unrelated Stop/composer-clear is evidence that this draft was submitted.
           if (conversationId() !== beforeConversation || composer() !== box || !box.isConnected ||
-              draftText() !== submitted || generating()) return finish(false);
+              draftText() !== submitted || busy()) return finish(false);
           if (box.getAttribute('aria-disabled') === 'true' || box.getAttribute('contenteditable') === 'false') return;
-          const button = sendButton();
+          const button = currentSendButton();
           if (!sendButtonEnabled(button)) return;
           if (authorizing) return;
           const click = () => {
@@ -2200,7 +2184,7 @@ var CLF_DOM = (() => {
             // Authorization can await the app. The exact editor, text and native control
             // must still be the ones it authorized; a late answer cannot revive this send.
             if (!stillCurrent() || conversationId() !== beforeConversation || composer() !== box ||
-                !box.isConnected || draftText() !== submitted || generating() || sendButton() !== button ||
+                !box.isConnected || draftText() !== submitted || busy() || currentSendButton() !== button ||
                 !sendButtonEnabled(button) || box.getAttribute('aria-disabled') === 'true' ||
                 box.getAttribute('contenteditable') === 'false') return finish(false);
             attempted = true;
@@ -2258,6 +2242,7 @@ var CLF_DOM = (() => {
   /** Observed ChatGPT Plugins settings surface. Missing/ambiguous structure is not proof. */
   async function pluginRefreshView(connectorName, expectedTools = [], expectedAppId = null) {
     const externalPlugins = connectorName === 'Chat On Steroids Plugins';
+    const maxTools = externalPlugins ? 257 : 64;
     const snapshot = await new Promise(resolve => {
       const nonce = crypto.randomUUID();
       const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
@@ -2268,10 +2253,12 @@ var CLF_DOM = (() => {
       const timer = setTimeout(() => finish(null), 1500);
       window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce }, location.origin);
     });
-    const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
-    if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : snapshot.connectorName !== connectorName) ||
-        !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 16) || JSON.stringify(snapshot.tools).length > 300000 ||
-        snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !/^[a-z][a-z0-9_]{0,79}$/.test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
+    const legacy = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
+    const current = /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname);
+    const appId = legacy?.[1] || current?.[1] || null;
+    if (!snapshot || snapshot.appId !== appId || (expectedAppId ? snapshot.appId !== expectedAppId : snapshot.connectorName !== connectorName) ||
+        !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > maxTools || JSON.stringify(snapshot.tools).length > 300000 ||
+        snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !/^[a-z0-9_.-]{1,64}$/i.test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
         new Set(snapshot.tools.map(tool => tool.name)).size !== snapshot.tools.length) return null;
     const buttons = [...document.querySelectorAll('button[data-clf-plugin-refresh]')].filter(button => button.getAttribute('data-clf-plugin-refresh') === snapshot.appId && button.getClientRects().length > 0);
     return typeof snapshot.refreshAvailable === 'boolean' && buttons.length === (snapshot.refreshAvailable ? 1 : 0) ? { appId: snapshot.appId, connectorName: snapshot.connectorName, versionId: typeof snapshot.versionId === 'string' ? snapshot.versionId.slice(0, 200) : null,
@@ -2281,13 +2268,23 @@ var CLF_DOM = (() => {
     return safe(() => {
       const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel => panel.getClientRects().length > 0 &&
         panel.getAttribute('aria-labelledby')?.endsWith('-trigger-Plugins'));
-      if (panels.length !== 1) return null;
+      const current = location.pathname === '/settings/plugins-settings';
+      if (panels.length !== 1 && !current) return null;
       // Installed settings rows are buttons, not the links in the /plugins catalog.
-      // Match the name's own leaf so adjacent permission text cannot alter identity.
-      const rows = [...panels[0].querySelectorAll('button')].filter(button => !button.disabled && button.getClientRects().length > 0 &&
-        button.querySelector('[data-testid="plugin-icon-wrapper"]'));
+      // The current path-routed settings page flattens the plugin name and description
+      // into the row button's accessible text, so an exact leaf-node equality test can
+      // return zero even when the provider visibly shows one installed connector. Keep
+      // the stronger legacy icon gate where it exists, then match the row text by the
+      // exact connector-name prefix and preserve the caller's exactly-one ambiguity check.
+      const scope = panels[0] || document;
+      const rows = [...scope.querySelectorAll('button')].filter(button => !button.disabled && button.getClientRects().length > 0 &&
+        !button.closest('[hidden],[aria-hidden="true"],[inert]') &&
+        (button.querySelector('[data-testid="plugin-icon-wrapper"]') || current));
       if (!rows.length) return null;
-      return rows.filter(button => [...button.querySelectorAll('*')].some(node => !node.children.length && text(node) === connectorName));
+      return rows.filter(button => {
+        const label = text(button);
+        return label === connectorName || label.startsWith(connectorName);
+      });
     }, null);
   }
   function pluginManagementIdle() {
@@ -2589,55 +2586,23 @@ var CLF_DOM = (() => {
     try {
       // Exact provider slug is preferred. Existing saved display slugs may resolve
       // only to an actually observed, available pair; never to an account default.
-      const name = normalizeModelLabel(model);
-      const modelRank = choice => !model || choice.familyId === model || choice.id === model ? 2
-        : name && normalizeModelLabel(choice.familyLabel) === name ? 1 : 0;
-      // Every available choice of the requested model, read once across versions, so the effort
-      // can be resolved against what the account actually offers before anything is moved.
-      const offered = [];
+      const name = normalizeModelLabel(model), candidates = [];
       for (const version of [original.versions.find(v => v.id === original.version), ...original.versions.filter(v => v.id !== original.version)]) {
         const state = await ui.version(version.id); if (!state) return false;
         for (const choice of state.choices) {
-          const rank = choice.available ? modelRank(choice) : 0;
-          if (rank) offered.push({ version: version.id, choice, rank });
+          if (!choice.available || (effort && choice.effort !== effort)) continue;
+          const rank = !model || choice.familyId === model || choice.id === model ? 2
+            : name && normalizeModelLabel(choice.familyLabel) === name ? 1 : 0;
+          if (rank) candidates.push({ version: version.id, choice, rank });
         }
       }
-      /*
-       * An effort the account no longer offers resolves to the nearest one it does.
-       *
-       * ChatGPT's newer model picker replaced its effort ladder: measured on 2026-09-26, the thinking
-       * models offer `medium`, `high` and `max`, and the step the UI now labels "Sehr hoch" is `max`.
-       * `xhigh` is simply gone. A saved `multiAgent.defaultReasoning = xhigh` therefore matched no
-       * choice at all, and every worker spawn failed outright with "The requested model or reasoning
-       * is unavailable" — worker-11, -12 and -13 in one homelab run, each one work the prime then had
-       * to do itself or abandon.
-       *
-       * Nearest by position in the shared vocabulary, ties upward: the request asked for at least
-       * this much reasoning, so the step above honours it better than the step below. Only within the
-       * requested model — a missing model still refuses, because picking a different model is not a
-       * rounding decision.
-       */
-      let wantedEffort = effort;
-      if (effort && offered.length && !offered.some(entry => entry.choice.effort === effort)) {
-        const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-        const target = ladder.indexOf(effort);
-        const efforts = [...new Set(offered.map(entry => entry.choice.effort))].filter(value => ladder.includes(value));
-        if (target >= 0 && efforts.length) {
-          efforts.sort((a, b) => {
-            const da = Math.abs(ladder.indexOf(a) - target), db = Math.abs(ladder.indexOf(b) - target);
-            return da - db || ladder.indexOf(b) - ladder.indexOf(a);
-          });
-          wantedEffort = efforts[0];
-        }
-      }
-      const candidates = offered.filter(entry => !wantedEffort || entry.choice.effort === wantedEffort);
       // An earlier version's display name cannot shadow a later exact execution id.
       // Captions such as High are effort labels, never model-name aliases. Repeated
       // Latest/version entries may describe the same pair; distinct families may not.
       const rank = Math.max(0, ...candidates.map(candidate => candidate.rank));
       const matches = candidates.filter(candidate => candidate.rank === rank);
       if (!matches.length || (model && new Set(matches.map(candidate => candidate.choice.familyId)).size !== 1) ||
-          (model && wantedEffort && new Set(matches.map(candidate => `${candidate.choice.id}\u0000${candidate.choice.effort}`)).size !== 1)) return false;
+          (model && effort && new Set(matches.map(candidate => `${candidate.choice.id}\u0000${candidate.choice.effort}`)).size !== 1)) return false;
       const wanted = matches.find(candidate => candidate.version === original.version && candidate.choice.bucket === original.currentBucket) || matches[0];
       const state = await ui.version(wanted.version), choice = wanted.choice;
       // Versions can change while traversing the UI. Revalidate before moving its slider.
@@ -2741,7 +2706,6 @@ var CLF_DOM = (() => {
     userMessageReaction,
     presentUserPrompts,
     composerVisible,
-    conversationLoadFailure,
     prepareChatModelSurface,
     newChatControl,
     projectHomeId,
@@ -2756,16 +2720,7 @@ var CLF_DOM = (() => {
     pluginInstalledButtons,
     pluginManagementIdle,
     selectModelSettings,
-    temporaryChatReady: () => safe(() => {
-      // The page's own state, where a mounted turn has published it. The glyph below is the only
-      // evidence an empty document has, and a layout that stops drawing it stops proving the
-      // mode at all; React holds the answer either way. The stamp carries the pathname it was
-      // made on, so one left behind by another route cannot answer for this one.
-      if ([...document.querySelectorAll(`${SHELL_TURN}[data-clf-temporary-chat]`)]
-        .some(node => node.getAttribute('data-clf-temporary-chat') === location.pathname)) return true;
-      // An empty document: the header toggle's own state, stamped by fiber.js on each scan.
-      if (document.documentElement.getAttribute('data-clf-temporary-page') === location.pathname) return true;
-      return [...document.querySelectorAll('button')].some(button => {
+    temporaryChatReady: () => safe(() => [...document.querySelectorAll('button')].some(button => {
       if (button.closest(`${OWN_SURFACES}, [data-message-author-role], [data-testid^="conversation-turn-"]`) || !button.getClientRects().length) return false;
       // The provider renders both icons at once. Only the visible checked glyph proves
       // the mode; translated labels and the requested URL are not activation receipts.
@@ -2778,8 +2733,7 @@ var CLF_DOM = (() => {
         }
         return true;
       });
-      });
-    }, false),
+    }), false),
     confirmTemporaryChatIntroduction: () => {
       const dialog = [...document.querySelectorAll('[role="dialog"]')].find(node =>
         [...node.querySelectorAll('h1,h2,[role="heading"]')].some(heading => text(heading, 100) === 'Temporary Chat') && /Not in history/.test(text(node, 2000)));
@@ -2795,6 +2749,8 @@ var CLF_DOM = (() => {
     messagesIn,
     sectionSignature,
     generating,
+    providerHold,
+    providerHoldReplacesStop,
     stopButton,
     stopGeneration,
     sendButton,
