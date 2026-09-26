@@ -3,7 +3,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { pluginManager } from './plugins/manager.js';
 import { refreshPluginPublication } from './connection.js';
-import { rearmPluginRefresh } from './plugin-refresh.js';
+import { forcePluginRefresh, forcePluginRefreshes, rearmPluginRefresh } from './plugin-refresh.js';
 
 const values = z.record(z.string().min(1).max(128), z.string().max(16_384)).refine(value => Object.keys(value).length <= 64, 'At most 64 configuration fields');
 const source = z.object({
@@ -25,6 +25,8 @@ export function registerPluginIpc(handle: Register, getWindow: () => BrowserWind
     if (error) throw new Error('Could not open the bundled Third-party Notices file.');
   });
   handle('plugins:snapshot', async () => pluginManager.snapshot());
+  handle('plugins:refreshAll', async () => forcePluginRefreshes());
+  handle('plugins:refreshConnector', async () => forcePluginRefresh('plugins'));
   handle('plugins:install', async payload => { await pluginManager.install(install.parse(payload)); return pluginManager.snapshot(); });
   handle('plugins:configure', async payload => {
     const input = identity.extend({ patch }).strict().parse(payload);

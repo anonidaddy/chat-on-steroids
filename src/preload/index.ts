@@ -11,6 +11,7 @@ import type { LocalProject } from '../shared/projects.js';
 import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
 import type { SkillSummary, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
+import type { PluginSurface } from '../shared/plugin-refresh.js';
 /**
  * The entire renderer-facing API.
  *
@@ -94,6 +95,8 @@ const api = {
   },
   openLegalNotices: () => call<void>('plugins:legalNotices'),
   pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
+  pluginsRefreshAll: () => call<PluginSurface[]>('plugins:refreshAll'),
+  pluginsRefreshConnector: () => call<PluginSurface[]>('plugins:refreshConnector'),
   pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
   pluginsConfigure: (id: string, patch: PluginConfigPatch) => call<PluginSnapshot>('plugins:configure', { id, patch }),
   pluginsRestart: (id: string) => call<PluginSnapshot>('plugins:restart', { id }),

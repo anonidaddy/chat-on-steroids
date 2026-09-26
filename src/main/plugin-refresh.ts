@@ -9,7 +9,8 @@ import type { PluginPublication, PluginRefreshRequest, PluginSurface, PluginTool
 
 const app = z.string().regex(/^asdk_app_[a-zA-Z0-9_-]{1,160}$/);
 const LEGACY_PLUGIN_MAX_TOOLS = 64;
-const rowSchema = z.object({ surface: z.enum(['core', 'desktop', 'plugins']), schemaId: z.string(), id: z.string().uuid(), appId: app.nullable(), completedSchemaId: z.string().nullable(), attempted: z.boolean(), manual: z.boolean().optional().default(false), error: z.string().max(200).optional(), versionId: z.string().max(200).optional(), failures: z.number().int().nonnegative().optional(), parked: z.boolean().optional() });
+const FIRST_PARTY_MAX_TOOLS = 64;
+const rowSchema = z.object({ surface: z.enum(['core', 'desktop', 'plugins']), schemaId: z.string(), id: z.string().uuid(), appId: app.nullable(), completedSchemaId: z.string().nullable(), attempted: z.boolean(), manual: z.boolean().optional().default(false), force: z.boolean().optional().default(false), error: z.string().max(200).optional(), versionId: z.string().max(200).optional(), failures: z.number().int().nonnegative().optional(), parked: z.boolean().optional() });
 type Row = z.infer<typeof rowSchema>;
 const publications = new Map<PluginSurface, PluginPublication>();
 const settling = new Map<PluginSurface, { schemaId: string; readyAt: number; timer?: ReturnType<typeof setTimeout> }>();
@@ -47,7 +48,7 @@ const hash = (value: unknown) => createHash('sha256').update(canonical(value)).d
 const declaration = (tools: PluginToolSchema[]) => tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })).sort((a, b) => a.name.localeCompare(b.name));
 function recognizable(tools: unknown, surface: PluginSurface = 'core'): tools is PluginToolSchema[] {
   // The registrar can append one local exec tool to the bounded upstream catalog.
-  if (!Array.isArray(tools) || (!tools.length && surface !== 'plugins') || tools.length > (surface === 'plugins' ? PLUGIN_MAX_TOOLS + 1 : 16) || JSON.stringify(tools).length > 300000) return false;
+  if (!Array.isArray(tools) || (!tools.length && surface !== 'plugins') || tools.length > (surface === 'plugins' ? PLUGIN_MAX_TOOLS + 1 : FIRST_PARTY_MAX_TOOLS) || JSON.stringify(tools).length > 300000) return false;
   if (tools.some(tool => !tool || typeof tool.name !== 'string' || typeof tool.description !== 'string' || !tool.inputSchema || typeof tool.inputSchema !== 'object')) return false;
   return tools.every(tool => tool.inputSchema.type === 'object') && new Set(tools.map(tool => tool.name)).size === tools.length;
 }
@@ -107,6 +108,89 @@ export function publishPluginSurface(surface: PluginSurface, connectorName: stri
 }
 export function unpublishPluginSurface(surface: PluginSurface): void { publications.delete(surface); }
 export function pluginRefreshPublications(): PluginPublication[] { return structuredClone([...publications.values()]); }
+/** True while a user-requested force refresh still owns at least one publication. */
+export function forcedPluginRefreshPending(): Promise<boolean> {
+  return serial(async () => (await rows()).some(row => row.force && publications.get(row.surface)?.schemaId === row.schemaId));
+}
+/**
+ * Force every currently published connector through ChatGPT's native Refresh tools control.
+ * The request is durable and the IPC promise resolves only after every exact schema is observed.
+ */
+async function forcePluginRefreshSurfaces(surfaces: readonly PluginSurface[], timeoutMs: number): Promise<PluginSurface[]> {
+  const wanted = new Set(surfaces);
+  const started = await serial(async () => {
+    const current = await rows();
+    const requests: Array<{ surface: PluginSurface; id: string }> = [];
+    for (const publication of publications.values()) {
+      if (!wanted.has(publication.surface)) continue;
+      const found = current.find(row => row.surface === publication.surface);
+      const next: Row = {
+        surface: publication.surface,
+        schemaId: publication.schemaId,
+        id: randomUUID(),
+        // Keep a previously proven App ID as the force-refresh identity anchor. The
+        // browser still revalidates that exact App ID against the provider settings
+        // page before it can claim/click. If the custom app was recreated and the ID
+        // is stale, refreshManagedPlugin's existing rediscovery path atomically drops
+        // only that stale ID and returns to the installed-plugin index. Clearing a
+        // valid ID up front forced changed Plugins catalogs back through first-enroll
+        // schema matching, which rejects legitimate tool-name changes before Refresh
+        // can ever run.
+        appId: found?.appId ?? null,
+        completedSchemaId: found?.completedSchemaId ?? null,
+        attempted: false,
+        manual: false,
+        force: true
+      };
+      if (found) current[current.indexOf(found)] = next; else current.push(next);
+      requests.push({ surface: publication.surface, id: next.id });
+    }
+    if (requests.length) await writeDurableNow('plugin-refresh', current);
+    return requests;
+  });
+  if (!started.length) return [];
+  wakeBrowserWork();
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const status = await serial(async () => {
+        const current = await rows();
+        let complete = 0;
+        for (const request of started) {
+          const row = current.find(candidate => candidate.surface === request.surface && candidate.id === request.id);
+          if (!row) return { error: `${request.surface} refresh was superseded` };
+          if (!row.force && row.completedSchemaId === row.schemaId) { complete++; continue; }
+          if (row.error && (row.attempted || row.manual || row.parked)) return { error: `${request.surface}: ${row.error}` };
+        }
+        return { complete };
+      });
+      if ('error' in status) throw new Error(status.error);
+      if (status.complete === started.length) return started.map(request => request.surface);
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error('Plugin refresh timed out before every connector was verified.');
+  } finally {
+    await serial(async () => {
+      const current = await rows();
+      let changed = false;
+      for (const request of started) {
+        const row = current.find(candidate => candidate.surface === request.surface && candidate.id === request.id);
+        if (row?.force) { row.force = false; changed = true; }
+      }
+      if (changed) await writeDurableNow('plugin-refresh', current);
+    });
+  }
+}
+
+/** Force every currently published connector through ChatGPT's native Refresh tools control. */
+export function forcePluginRefreshes(timeoutMs = 90_000): Promise<PluginSurface[]> {
+  return forcePluginRefreshSurfaces([...publications.keys()], timeoutMs);
+}
+
+/** Force exactly one published connector without touching the other WebGPT plugins. */
+export function forcePluginRefresh(surface: PluginSurface, timeoutMs = 90_000): Promise<PluginSurface[]> {
+  return forcePluginRefreshSurfaces([surface], timeoutMs);
+}
 /** One fresh browser attempt after an explicit Restart, only before any Refresh claim. */
 export function rearmPluginRefresh(surface: PluginSurface): Promise<boolean> {
   return serial(async () => {
@@ -123,6 +207,24 @@ export function rearmPluginRefresh(surface: PluginSurface): Promise<boolean> {
     return true;
   });
 }
+/**
+ * Forget one pre-claim App ID after ChatGPT proves that installed target no longer resolves.
+ * The same durable request is retained so the browser can rediscover the unique installed row
+ * by connector name and then claim the newly observed exact App ID.
+ */
+export function rediscoverPluginRefresh(input: { id: string; appId: string }): Promise<boolean> {
+  return serial(async () => {
+    const current = await rows();
+    const row = current.find(candidate => candidate.id === input.id);
+    if (!row || row.attempted || row.manual || row.appId !== input.appId || publications.get(row.surface)?.schemaId !== row.schemaId) return false;
+    row.appId = null;
+    delete row.error;
+    delete row.failures;
+    delete row.parked;
+    await writeDurableNow('plugin-refresh', current);
+    return true;
+  });
+}
 /** App IDs are stable connector identities. The browser must prove current installation. */
 export function pendingPluginRefreshes(): Promise<PluginRefreshRequest[]> {
   return serial(async () => {
@@ -131,7 +233,7 @@ export function pendingPluginRefreshes(): Promise<PluginRefreshRequest[]> {
     for (const publication of publications.values()) {
       const found = current.find(row => row.surface === publication.surface);
       if (found?.schemaId === publication.schemaId) continue;
-      const next: Row = { surface: publication.surface, schemaId: publication.schemaId, id: randomUUID(), appId: found?.appId ?? null, completedSchemaId: found?.completedSchemaId ?? null, attempted: false, manual: false };
+      const next: Row = { surface: publication.surface, schemaId: publication.schemaId, id: randomUUID(), appId: found?.appId ?? null, completedSchemaId: found?.completedSchemaId ?? null, attempted: false, manual: false, force: false };
       if (found) current[current.indexOf(found)] = next; else current.push(next);
       changed = true;
     }
@@ -141,28 +243,33 @@ export function pendingPluginRefreshes(): Promise<PluginRefreshRequest[]> {
     }
     return current.flatMap(row => {
       const publication = publications.get(row.surface);
-      return publication && (settling.get(row.surface)?.readyAt ?? 0) <= Date.now() && publication.schemaId === row.schemaId && !row.attempted && !row.manual && !row.parked && row.completedSchemaId !== row.schemaId
-        ? [{ ...structuredClone(publication), id: row.id, appId: row.appId }] : [];
+      return publication && (row.force || (settling.get(row.surface)?.readyAt ?? 0) <= Date.now()) && publication.schemaId === row.schemaId && !row.attempted && !row.manual && !row.parked && (row.force || row.completedSchemaId !== row.schemaId)
+        ? [{ ...structuredClone(publication), id: row.id, appId: row.appId, force: row.force }] : [];
     });
   });
 }
 type Identity = { id: string; appId: string };
 function exact(current: Row[], identity: Identity): Row | undefined {
   if (!app.safeParse(identity.appId).success) return;
-  return current.find(row => row.id === identity.id && publications.get(row.surface)?.schemaId === row.schemaId && (settling.get(row.surface)?.readyAt ?? 0) <= Date.now());
+  return current.find(row => row.id === identity.id && publications.get(row.surface)?.schemaId === row.schemaId && (row.force || (settling.get(row.surface)?.readyAt ?? 0) <= Date.now()));
 }
 /** Commit one attempted click before the browser acts. A crash never re-arms it. */
-export function claimPluginRefresh(input: Identity & { connectorName: string; tools: unknown; alreadyCurrent?: boolean }): Promise<boolean> {
+export function claimPluginRefresh(input: Identity & { connectorName: string; tools: unknown; alreadyCurrent?: boolean; force?: boolean }): Promise<boolean> {
   return serial(async () => {
     const current = await rows(); const row = exact(current, input);
-    if (!row || row.attempted || row.manual || row.completedSchemaId === row.schemaId || !recognizable(input.tools, row.surface)) return false;
+    if (!row || row.attempted || row.manual || (!row.force && row.completedSchemaId === row.schemaId) || !recognizable(input.tools, row.surface)) return false;
     const publication = publications.get(row.surface)!;
     // Unique-name discovery is initial enrollment only. Stale definitions can still
     // identify the surface; the complete post-refresh declarations must match below.
     if (row.appId ? row.appId !== input.appId : input.connectorName !== publication.connectorName || !enrollable(input.tools, publication)) return false;
     if (current.some(other => other !== row && other.appId === input.appId)) return false;
     const isCurrent = matches(input.tools, publication.tools, row.surface);
-    if (input.alreadyCurrent === true ? !isCurrent : isCurrent) return false;
+    // Force ownership is durable main-process state. The browser does not need to
+    // echo it back as an authority bit: requiring that echo made a perfectly owned
+    // request fail when an older extension worker dropped the optional field in
+    // transit. The exact request id, connector identity and observed tool schema are
+    // still validated above; row.force alone decides forced-click semantics here.
+    if (row.force ? input.alreadyCurrent === true : (input.alreadyCurrent === true ? !isCurrent : isCurrent)) return false;
     row.appId = input.appId; row.attempted = true;
     delete row.error;
     // Enrollment/migration may find the installed declaration already current. Record
@@ -198,7 +305,7 @@ export function completePluginRefresh(input: Identity & { tools: unknown; versio
   return serial(async () => {
     const current = await rows(); const row = exact(current, input);
     if (!row || row.manual || !row.attempted || row.appId !== input.appId || !matches(input.tools, publications.get(row.surface)!.tools, row.surface)) return false;
-    row.completedSchemaId = row.schemaId; delete row.error;
+    row.completedSchemaId = row.schemaId; row.force = false; delete row.error; delete row.failures; delete row.parked;
     if (input.versionId) row.versionId = input.versionId.slice(0, 200);
     await writeDurableNow('plugin-refresh', current); return true;
   });
@@ -206,7 +313,7 @@ export function completePluginRefresh(input: Identity & { tools: unknown; versio
 export function failPluginRefresh(input: { id: string; error: string }): Promise<boolean> {
   return serial(async () => {
     const current = await rows(); const row = current.find(row => row.id === input.id);
-    if (!row || publications.get(row.surface)?.schemaId !== row.schemaId || row.completedSchemaId === row.schemaId) return false;
+    if (!row || publications.get(row.surface)?.schemaId !== row.schemaId || (!row.force && row.completedSchemaId === row.schemaId)) return false;
     // Only claimPluginRefresh records an attempted click. Pre-claim failures remain
     // diagnostic errors, distinct from an ambiguous post-click outcome. Existing
     // maintenance may reobserve the same owned page until a claim actually succeeds.
