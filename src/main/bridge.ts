@@ -8859,3 +8859,259 @@ function restoredCommandSnapshot(
 /**
  * Pure-with-respect-to-bridge-state reconstruction of the durable file.
  *
+ * A settings stop/start deliberately retains in-memory commands; those are newer authority and
+ * win every duplicate. Disk contributes only missing commands/receipts. Most importantly this
+ * function never pushes into `commands`, arms a timer or publishes a receipt while later recovery
+ * awaits can still fail.
+ */
+function planCommandRestore(
+  saved: { version?: number; commands?: unknown; receipts?: unknown },
+  now: number
+): CommandRestorePlan | null {
+  const version = saved.version;
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 || !Array.isArray(saved.commands)) return null;
+
+  const plannedCommands = [...commands];
+  const plannedReceipts = commandReceipts
+    .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
+    .slice(-MAX_COMMAND_RECEIPTS);
+  const receiptIds = new Set(plannedReceipts.map((receipt) => receipt.id));
+  if (version !== 1 && Array.isArray(saved.receipts)) {
+    for (const raw of saved.receipts as Array<Partial<CommandReceipt>>) {
+      const receipt = restoredReceipt(raw, now);
+      if (!receipt || receiptIds.has(receipt.id)) continue;
+      receiptIds.add(receipt.id);
+      plannedReceipts.push(receipt);
+    }
+    if (plannedReceipts.length > MAX_COMMAND_RECEIPTS) {
+      plannedReceipts.splice(0, plannedReceipts.length - MAX_COMMAND_RECEIPTS);
+    }
+  }
+
+  const retainedKeys = new Set(plannedCommands.map((command) => specKey(command.spec)));
+  const expiredRevivals: Array<{
+    id: string;
+    spec: Extract<CommandSpec, { type: 'revive' }>;
+  }> = [];
+  const resumeTokens: Array<{ sessionId: string; token: string }> = plannedCommands
+    .filter(
+      (
+        command
+      ): command is Command & {
+        spec: Extract<CommandSpec, { type: 'resume' }>;
+      } => command.spec.type === 'resume'
+    )
+    .map((command) => ({
+      sessionId: command.spec.sessionId,
+      token: command.spec.token
+    }));
+  const durableCandidates = new Map<
+    string,
+    { raw: Partial<DurableCommandRecord>; spec: CommandSpec; createdAt: number }
+  >();
+  let restored = 0;
+
+  for (const raw of saved.commands as Array<Partial<DurableCommandRecord>>) {
+    const specRaw = raw.spec as Partial<CommandSpec> | undefined;
+    if (!specRaw || typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 64) continue;
+    const spec = restoredCommandSpec(version, specRaw);
+    if (!spec) continue;
+    const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : 0;
+    const key = specKey(spec);
+    // In-memory state survived a settings stop/start and is newer authority than the disk
+    // snapshot it produced. A stale old durable row for the same worker must never cancel or
+    // replace that newer live transport merely because both have the same friendly key.
+    if (retainedKeys.has(key) || receiptIds.has(raw.id)) continue;
+    const prior = durableCandidates.get(key);
+    // Corrupt/legacy files can contain two incarnations of one transport key. Pick authority
+    // first, then apply TTL semantics to that one record only. Newer createdAt wins; a later
+    // record wins a tie so reconstruction is deterministic for whole-file duplicates.
+    if (!prior || createdAt >= prior.createdAt) durableCandidates.set(key, { raw, spec, createdAt });
+  }
+
+  for (const { raw, spec, createdAt } of durableCandidates.values()) {
+    if (spec.type === 'resume') resumeTokens.push({ sessionId: spec.sessionId, token: spec.token });
+    const persistedLeased = version !== 1 && raw.phase === 'leased';
+    // The broker cannot yet say whether a restored wake was delivered, so disk rows get the
+    // longer budget here; the deadline re-armed below applies the exact one.
+    const stale = spec.type === 'revive'
+      ? now - createdAt >= REVIVAL_ACTIVITY_MS
+      : now - createdAt > COMMAND_TTL_MS;
+    if (stale) {
+      if (spec.type === 'revive') expiredRevivals.push({ id: raw.id!, spec });
+      continue;
+    }
+
+    const continuation = spec.type === 'resume' ? continuationByToken(spec.token) : null;
+    const legacyAlreadyClaimed =
+      version === 1 && continuation !== null &&
+      (continuation.state === 'claimed' || continuation.state === 'committing' || continuation.state === 'committed');
+    const leased = persistedLeased || legacyAlreadyClaimed;
+    let claimedAt = leased && typeof raw.claimedAt === 'number' && Number.isFinite(raw.claimedAt) ? raw.claimedAt : null;
+    if (leased && claimedAt === null) claimedAt = now;
+    if (claimedAt !== null && claimedAt > now + COMMAND_DEADLINE_MS) claimedAt = now;
+    plannedCommands.push({
+      id: raw.id!,
+      spec,
+      createdAt,
+      claimedAt,
+        timer: null,
+      lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
+      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null
+    });
+    restored += 1;
+  }
+
+  // Retained commands normally win over disk, but the same absolute waking deadline still applies.
+  // A newer retained revival is not touched by an older expired disk row because disk candidates
+  // for its key were discarded above before expiry was considered.
+  const expiredRetainedRevivalIds = new Set<string>();
+  for (const command of plannedCommands) {
+    if (command.spec.type !== 'revive' || now < revivalDeadlineAt(command)) continue;
+    expiredRevivals.push({ id: command.id, spec: command.spec });
+    expiredRetainedRevivalIds.add(command.id);
+  }
+  const commandsAfterExpiredRevival = plannedCommands.filter(
+    (command) => !expiredRetainedRevivalIds.has(command.id)
+  );
+
+  return {
+    commands: commandsAfterExpiredRevival,
+    receipts: plannedReceipts.slice(-MAX_COMMAND_RECEIPTS),
+    expiredRevivals,
+    resumeTokens,
+    restored
+  };
+}
+
+/**
+ * Reloads commands left over from a previous run.
+ *
+ * Ordinary commands older than the TTL are discarded rather than acted on: reopening the app
+ * the next morning must not spray yesterday's chats across the browser. A revival is stricter:
+ * after thirty seconds it releases the broker's `waking` reservation and the worker becomes
+ * sleeping/revivable again. Version 2 persists the queued/leased phase and document owner; version
+ * 1 is migrated conservatively, including resume commands whose continuation WAL survived.
+ */
+export async function restoreCommands(): Promise<void> {
+  const saved = await readDurable<{
+    version?: number;
+    commands?: unknown;
+    receipts?: unknown;
+  }>(COMMANDS_STATE);
+  if (!saved) return;
+  const now = Date.now();
+  const plan = planCommandRestore(saved, now);
+  if (!plan) return;
+
+  if (plan.expiredRevivals.length > 0) {
+    let brokerRelevant = false;
+    for (const expired of plan.expiredRevivals) {
+      const revive = expired.spec;
+      // Run id was already validated above. Check the exact conversation too so a stale command
+      // for an earlier binding cannot knock down a newer wake for the same friendly worker id.
+      // `brokerRelevant` deliberately survives a prior failed recovery attempt: that attempt may
+      // already have moved the live worker back to sleeping while the durable swarm is still
+      // waking. A later startup must fsync the *current* broker state before it may prune the old
+      // command, even though pendingWorkerRevivals() no longer lists it.
+      if (agentForConversation(revive.conversationId) !== revive.agent) continue;
+      brokerRelevant = true;
+      const owed = pendingWorkerRevivals().find(
+        (entry) => entry.id === revive.agent && entry.conversationId === revive.conversationId && entry.runId === revive.runId
+      );
+      if (!owed) continue;
+      failWorkerRevival(revive.agent, 'its durable revival expired while the app was not running', revive.runId);
+    }
+
+    if (brokerRelevant) {
+      // Crash order is load-bearing: durable `sleeping` first, command pruning second. If the
+      // command vanished first and the process died here, the next startup would restore
+      // `waking` with no matching old command and recreate the fresh-TTL bug.
+      let persisted = false;
+      try {
+        persisted = await persistCriticalSwarmNow();
+      } catch (err) {
+        throw new Error(
+          `could not durably settle expired worker revival(s); bridge startup must retry before pruning them — ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      if (!persisted) {
+        throw new Error('could not durably settle expired worker revival(s); bridge startup must retry before pruning them');
+      }
+    }
+
+  }
+
+  // One explicit durable rewrite from the local plan. No live bridge state participates in this
+  // snapshot, so an overlapping callback/request cannot smuggle a half-restored generation onto
+  // disk. If storage fails after broker reconciliation, the safe old disk row remains and
+  // durable.ts retains this exact newer generation for retry; publishing the already-reconciled
+  // plan in memory is safe because admission is still fenced by bridgeRecovering.
+  let rewriteDurable = true;
+  try {
+    await writeDurableNow(COMMANDS_STATE, restoredCommandSnapshot(plan.commands, plan.receipts, now));
+    rewriteDurable = false;
+  } catch (err) {
+    logWarn(`bridge: could not persist reconstructed command state — ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // This is the only publication point of restore. Everything above operated on local arrays;
+  // everything below may again use ordinary live command helpers and timers.
+  commands = plan.commands;
+  commandReceipts = plan.receipts;
+  for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
+  rearmRetainedCommandDeadlines();
+  if (plan.restored > 0) {
+    logInfo(`bridge: restored ${plan.restored} chat command(s) from the previous run`);
+    changed();
+  }
+  if (rewriteDurable) persistCommands();
+  // Recovery may have just turned the last expired `waking` worker back into a stopped worker.
+  // Do not resurrect the old global active claim merely because no request exists yet to run
+  // the usual dispatcher/stale-sweep release hook.
+  releaseQuiescentRun();
+}
+
+/** Test seam. */
+export function resetBridgeForTests(): void {
+  clearCompanionDiagnostics();
+  for (const command of commands) if (command.timer) clearTimeout(command.timer);
+  if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
+  browserPresenceTimer = null;
+  commands = [];
+  commandReceipts = [];
+  commandRetirementsAwaitingBroker.clear();
+  commandWrites.clear();
+  commandRedeems.clear();
+  bridgeRecovering = false;
+  bridgeShutdownRequested = false;
+  bridgeError = null;
+  clearUnattributedIncident();
+  activeUntil.clear();
+  awaitingReturn.clear();
+  lastAttributedCallAt.clear();
+  fiberHealth.clear();
+  markedReplacementNotices.clear();
+  refusalNoticedAt.clear();
+  pickupWatch.clear();
+  compactionWatch.clear();
+  // Re-armed rather than cleared: the seam stands in for a process that has just started
+  // serving, which is exactly what the fence measures. Clearing it would leave the watchdog
+  // permanently off in every suite that starts the bridge once and resets between tests.
+  pickupWatchFloor = Date.now();
+  compactionWatchFloor = pickupWatchFloor;
+  resetContinuationsForTests();
+  sessionTokens.clear();
+  openInBrowser = null;
+  if (browserLaunchTimer) clearTimeout(browserLaunchTimer);
+  browserLaunchTimer = null;
+  lastBrowserLaunchAt = 0;
+  lastSeenAt = null;
+  extensionVersion = null;
+  versionWarned = false;
+  requestWindow = { start: Date.now(), count: 0 };
+}
+
+export function bridgePort(): number | null {
+  return port;
+}
