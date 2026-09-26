@@ -102,6 +102,28 @@ const GROUPS: Group[] = [
 let state: AppState | null = null;
 /** Guards against saving while we are writing values into the controls. */
 let applying = false;
+let pluginRefreshRunning = false;
+
+function paintPluginRefreshRunning(running: boolean): void {
+  pluginRefreshRunning = running;
+  const button = $<HTMLButtonElement>('refreshPlugins');
+  button.disabled = running;
+  button.setAttribute('aria-busy', String(running));
+  ui($('refreshPluginsLabel'), 'textContent', () => running ? t('Refreshing plugins') : t('Refresh plugins'));
+  $('pluginRefreshBusy').hidden = !running;
+  document.querySelector<HTMLElement>('.card.is-session')?.classList.toggle('is-plugin-refreshing', running);
+}
+
+async function refreshPluginsNow(): Promise<void> {
+  if (pluginRefreshRunning) return;
+  paintPluginRefreshRunning(true);
+  try {
+    const refreshed = await run(api.pluginsRefreshAll());
+    if (refreshed !== null) toast(t('Refreshed'));
+  } finally {
+    paintPluginRefreshRunning(false);
+  }
+}
 
 /**
  * Applies persisted form state without erasing a value the user is currently editing.
@@ -195,11 +217,13 @@ $('sidebarConnection').addEventListener('click', () => {
   setConnectionPopover(Boolean($('connectionPopover').hidden));
 });
 $('chatSettingsBtn').addEventListener('click', () => showTab('settings'));
+$('extensionSetup').addEventListener('click', () => showTab('setup'));
 $('sessionList').addEventListener('click', event => {
   if ((event.target as HTMLElement).closest('[data-id], [data-new-project]')) showTab('chat');
 }, { capture: true });
 $('newChat').addEventListener('click', () => showTab('chat'));
 $('sidebarPlugins').addEventListener('click', () => showTab('plugins'));
+$('refreshPlugins').addEventListener('click', () => { void refreshPluginsNow(); });
 $('addProject').addEventListener('click', () => showTab('chat'));
 $('composerFolder').addEventListener('click', () => $('addProject').click());
 let zoomFactor = 1;

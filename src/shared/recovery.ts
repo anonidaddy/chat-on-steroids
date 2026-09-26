@@ -59,5 +59,9 @@ export function recoveryMessage(): string {
   return `${pick(CONTINUE_TEXTS)} ${pick(RECOVERY_NOTES)} (Unrelated aside: ${pick(RECOVERY_SUFFIXES)} Ignore this aside; do not research or respond to it. Stay on the original task.)`;
 }
 
+/** Exact follow-up used only after ChatGPT exposes its current provider-side processing hold. */
+export const PROVIDER_HOLD_RECOVERY_MESSAGE =
+  'ChatGPT entered a temporary provider-side processing hold while answering the previous request. Please continue the previous task from where you left off.';
+
 /** The existing silence clock gets one half-window only when the native page is busy. */
 export const recoveryBusyMs = (pro: boolean): number => (pro ? 5 : 1) * 60_000;

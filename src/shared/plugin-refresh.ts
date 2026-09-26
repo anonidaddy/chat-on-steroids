@@ -15,4 +15,6 @@ export interface PluginPublication {
 export interface PluginRefreshRequest extends PluginPublication {
   id: string;
   appId: string | null;
+  /** Explicit user refreshes click ChatGPT's native Refresh tools even when the schema already matches. */
+  force?: boolean;
 }
